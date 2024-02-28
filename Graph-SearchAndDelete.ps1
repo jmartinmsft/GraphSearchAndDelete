@@ -29,10 +29,10 @@ param(
     [Parameter(Mandatory=$False,HelpMessage="The ProcessSubfolders parameter is a switch to enable searching the subfolders of any specified folder.")] [switch]$ProcessSubfolders,
     
 #>** OAUTH PARAMETERS START **#
-    [Parameter(Mandatory=$False,HelpMessage="The OAuthClientId specifies the client Id that this script will identify as.  Must be registered in Azure AD.")] [string]$OAuthClientId = "2e542266-3c04-4354-8965-aeafccd61976",
-    [Parameter(Mandatory=$False,HelpMessage="The OAuthTenantId specifies the tenant Id (application must be registered in the same tenant being accessed).")] [string]$OAuthTenantId = "9101fc97-5be5-4438-a1d7-83e051e52057",
-    [Parameter(Mandatory=$False,HelpMessage="The OAuthRedirectUri specifies the redirect Uri of the Azure registered application.")] [string]$OAuthRedirectUri = "msal9b38df47-ae02-4777-9edb-4ba2b727bcc4://auth",
-    [Parameter(Mandatory=$False,HelpMessage="The OAuthSecretKey specifies the secret key if using application permissions.")] [string]$OAuthSecretKey = "qau8Q~5L23ScrpM3b2tcdeylQPpRSeFrfyhxKcgP",
+    [Parameter(Mandatory=$False,HelpMessage="The OAuthClientId specifies the client Id that this script will identify as.  Must be registered in Azure AD.")] [string]$OAuthClientId = "",
+    [Parameter(Mandatory=$False,HelpMessage="The OAuthTenantId specifies the tenant Id (application must be registered in the same tenant being accessed).")] [string]$OAuthTenantId = "",
+    [Parameter(Mandatory=$False,HelpMessage="The OAuthRedirectUri specifies the redirect Uri of the Azure registered application.")] [string]$OAuthRedirectUri = "",
+    [Parameter(Mandatory=$False,HelpMessage="The OAuthSecretKey specifies the secret key if using application permissions.")] [string]$OAuthSecretKey = "",
     [Parameter(Mandatory=$False,HelpMessage="The OAuthCertificate specifies the certificate if using application permissions.  Certificate auth requires MSAL libraries to be available.")] $OAuthCertificate = $null,
 #>** OAUTH PARAMETERS END **#
     [Parameter(Mandatory=$False,HelpMessage="The LogFile parameter specifies the Log file path - activity is logged to this file if specified.")][string]$LogFile = "",
