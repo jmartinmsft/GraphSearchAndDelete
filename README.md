@@ -5,6 +5,9 @@ This PowerShell script can be used to search and delete content from a mailbox u
 Requirements
 An application registration must be created in Azure AD for the tenant and this application must have the Mail.ReadWrite API permission for Microsoft Graph. The script also required the MSAL.PS PowerShell module.
 
+NOTE:
+Message body searches are limited to 275 results per folder. Multiple runs are needed to delete more than 275 items from a folder.
+
 How To Run
 This syntax will search the Inbox for items from a sender with the email address kelly@contoso.com and generate a CSV file with the results.
 
