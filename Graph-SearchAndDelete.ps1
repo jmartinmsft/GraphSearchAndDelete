@@ -198,7 +198,6 @@ function GetOAuthToken {
         $OAuthSecretKey = $OAuthSecretKey | ConvertTo-SecureString -Force -AsPlainText
         $Script:OAuthToken = Get-MsalToken -ClientId $OAuthClientId -ClientSecret $OAuthSecretKey -TenantId $OAuthTenantId -Scopes $Script:Scope -AzureCloudInstance AzurePublic
     }
-    $Script:OAuthTokenAcquireTime = [DateTime]::UtcNow
     return $Script:OAuthToken.AccessToken
 }
 
@@ -207,12 +206,9 @@ function Send-GraphRequest{
         [Parameter(Mandatory=$true, HelpMessage="The Uri parameter specifies the request uri.")] [string] $Uri,
         [Parameter(Mandatory=$false, HelpMessage="The HttpMethod parameter specifies the method for the request.")] [string] $HttpMethod="GET"
     )
-    if ([DateTime]::UtcNow.AddSeconds(-10) -gt $Script:OAuthToken.ExpiresOn.UtcDateTime) {
-        Write-Host "Acquiring new token using the refresh token..." -ForegroundColor Cyan
-        $body = @{grant_type="refresh_token";scope=$Script:Scope;client_id=$OAuthClientId;refresh_token=$Script:OAuthToken.refresh_token}
-        $Script:OAuthToken = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$OAuthTenantId/oauth2/v2.0/token" -Body $body
-        $Script:Token = $Script:OAuthToken.access_token
-        $script:OAuthTokenAcquireTime = [DateTime]::UtcNow
+    if($Script:OAuthToken.ExpiresOn -lt (Get-Date)) {
+        Write-Host "Acquiring new token..." -ForegroundColor Cyan
+        $Script:Token = GetOAuthToken
         $Headers = @{
             'Content-Type'  = "application\json"
             'Authorization' = "Bearer $Script:Token"
@@ -238,17 +234,17 @@ function Send-GraphRequest{
 
         do {
             try {
-                $Results = Invoke-RestMethod @Messageparams # -Headers $Headers -Uri $Uri -UseBasicParsing -Method "GET" -ContentType "application/json"
+                $Results = Invoke-RestMethod @Messageparams
                 $StatusCode = $Results.StatusCode
             } 
             catch {
                 $StatusCode = $_.Exception.Response.StatusCode.value__
                 if ($StatusCode -eq 429) {
-                    Write-Warning "Request being throttled. Sleeping for 50 seconds..."
-                    Start-Sleep -Seconds 50
+                    Write-Warning "Request was throttled. Waiting for 60 seconds to retry..."
+                    Start-Sleep -Seconds 60
                 }
                 elseif ($StatusCode -eq 504) {
-                    Write-Warning "Request received timeout error. Retrying in 20 seconds..."
+                    Write-Warning "Request received timeout error. Waiting for 20 seconds to retry..."
                     Start-Sleep -Seconds 20
                 }
                 else {
@@ -257,7 +253,6 @@ function Send-GraphRequest{
             }
         } 
         while ($StatusCode -eq 429)
-        #$Response = Invoke-RestMethod @Messageparams
         return $Results
 
 }
@@ -268,7 +263,6 @@ function GetFolderList {
         $FolderResults = Send-GraphRequest -Uri "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/RecoverableItemsRoot/childfolders/?includeHiddenFolders=true"
     }
     else {
-        #$FolderResults = Send-GraphRequest -Uri "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Root/childfolders/?$Top=500"
         $FolderResults = Send-GraphRequest -Uri "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/delta"
     }
     foreach($Result in $FolderResults.Value){
