@@ -77,7 +77,7 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="The OAuthRedirectUri parameter is the redirect Uri of the Azure registered application.")] 
     [string]$OAuthRedirectUri = "https://login.microsoftonline.com/common/oauth2/nativeclient",
     
-    [Parameter(Mandatory=$False,HelpMessage="The OAuthSecretKey parameter is the the secret for the registered application.")] 
+    [Parameter(Mandatory=$False,HelpMessage="The OAuthClientSecret parameter is the the secret for the registered application.")] 
     [SecureString]$OAuthClientSecret = "",
     
     [Parameter(Mandatory=$False,HelpMessage="The OAuthCertificate parameter is the certificate for the registered application. Certificate auth requires MSAL libraries to be available.")] 

@@ -9,17 +9,18 @@ NOTE:
 Message body searches are limited to 275 results per folder. Multiple runs are needed to delete more than 275 items from a folder.
 
 How To Run
+$secret = ConvertTo-SecureString -String "RQD8Q~DAMByQMCeLMgg_QGfIMS3y" -AsPlainText -Force
 This syntax will search the Inbox for items from a sender with the email address kelly@contoso.com and generate a CSV file with the results.
 
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -SenderAddress kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthSecretKey qau8Q~5L23ScrpM3b2tcd
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -SenderAddress kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 
 This syntax will search the entire mailbox from items where the subject contains the word Microsoft and the message body contains the word Exchange, generate a CSV file with the results, and delete the items.
 
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -Subject Microsoft -MessageBody Exchange -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthSecretKey qau8Q~5L23ScrpM3b2tcd
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -Subject Microsoft -MessageBody Exchange -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 
 This syntax will search the Recoverable Items for items created between 01 Jan 2024 and 31 Jan 2024, generate a CSV file with the results, and delete the items.
 
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -CreatedAfter 2024-01-01 -CreatedBefore 2024-01-31 -SearchDumpster -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthSecretKey qau8Q~5L23ScrpM3b2tcd
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -CreatedAfter 2024-01-01 -CreatedBefore 2024-01-31 -SearchDumpster -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 
 Parameters
 
@@ -74,8 +75,8 @@ The OAuthTenantId paramter is the tenant Id where the application is registered 
 OAuthRedirectUri
 The OAuthRedirectUri parameter is the redirect Uri of the Azure registered application.
 
-OAuthSecretKey
-The OAuthSecretKey parameter is the the secret for the registered application.
+OAuthClientSecret
+The OAuthClientSecret parameter is the the secret for the registered application.
 
 OAuthCertificate
 The OAuthCertificate parameter is the certificate for the registerd application. Certificate auth requires MSAL libraries to be available..
