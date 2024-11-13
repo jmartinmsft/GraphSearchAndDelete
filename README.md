@@ -17,9 +17,9 @@ Search the Inbox for items from a sender and only generate a CSV file with the r
 $secret = ConvertTo-SecureString -String "xxxxxxxxxxxxxxxxxxxxxxxxxx" -AsPlainText -Force
 .\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -SenderAddress kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 ```
-Search the entire mailbox for items containing a subject and message body and delete those items:
+Search the entire mailbox for items containing a subject and message body and delete those items in batches of 10 items:
 ```powershell
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -Subject Microsoft -MessageBody Exchange -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -Subject Microsoft -MessageBody Exchange -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret -BatchSize 10
 ```
 Search the recoverable items for items within a date range and delete those items:
 ```powershell
@@ -32,9 +32,11 @@ Search the recoverable items for items within a date range and delete those item
 
 **ProcessSubfolders** - The ProcessSubfolders parameter is a switch to enable searching the subfolders of any specified folder
 
-**IncludeFolderList** - The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the Inbox folder will be searched).  Any exclusions override this list.
+**IncludeSubfolders** - The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the Inbox folder will be searched).  Any exclusions override this list.
 
 **ExcludeFolderList** - The ExcludeFolderList parameter specifies the folder(s) to be excluded (these folders will not be searched).
+
+**ExcludeSubfolders** - The ExcludeSubfolders parameter is a switch to prevent searching the subfolders of the ExcludeFolderList.
 
 **SearchDumpster** - The SearchDumpster parameter is a switch to search the recoverable items.
 
@@ -71,3 +73,5 @@ Search the recoverable items for items within a date range and delete those item
 **OutputPath** - The OutputPath parameter specifies the path for the EWS usage report.
 
 **ThrottlingDelay** - The ThrottlingDelay parameter specifies the throttling delay (time paused between sending EWS requests) - note that this will be increased automatically if throttling is detected"
+
+**BatchSize** - The BatchSize parameter specifies how many items to delete within a batch request.
