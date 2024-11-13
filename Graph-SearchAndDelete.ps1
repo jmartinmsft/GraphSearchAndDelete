@@ -21,21 +21,24 @@
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE
 #>
-# Version 24.07.08.1516
+# Version 24.11.12.1014
 
 param (
     [Parameter(Position=0,Mandatory=$True,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
     [ValidateNotNullOrEmpty()] 
     [string]$Mailbox,
 	
-    [Parameter(Mandatory=$False,HelpMessage="The ProcessSubfolders parameter is a switch to enable searching the subfolders of any specified folder.")] 
-    [switch]$ProcessSubfolders,
+    [Parameter(Mandatory=$False,HelpMessage="The ProcessSubfolders parameter is a switch to enable searching the subfolders of the IncludeFolderList.")] 
+    [switch]$IncludeSubfolders,
 	
     [Parameter(Mandatory=$False,HelpMessage="The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the Inbox folder will be searched).  Any exclusions override this list.")] 
     $IncludeFolderList=$null,
     
     [Parameter(Mandatory=$False,HelpMessage="The ExcludeFolderList parameter specifies the folder(s) to be excluded (these folders will not be searched).")] 
     $ExcludeFolderList=$null,
+
+    [Parameter(Mandatory=$False,HelpMessage="The ExcludeSubfolders parameter is a switch to prevent searching the subfolders of the ExcludeFolderList.")] 
+    [switch]$ExcludeSubfolders,
 
     [Parameter(Mandatory=$false,HelpMessage="The SearchDumpster parameter is a switch to search the recoverable items.")] 
     [switch]$SearchDumpster,
@@ -89,7 +92,10 @@ param (
     [ValidateScript({ Test-Path $_ })] [Parameter(Mandatory = $true, HelpMessage="The OutputPath parameter specifies the path for the EWS usage report.")] [string] $OutputPath,
 
     [Parameter(Mandatory=$False,HelpMessage="The ThrottlingDelay parameter specifies the throttling delay (time paused between sending EWS requests) - note that this will be increased automatically if throttling is detected")]
-    [int]$ThrottlingDelay = 0
+    [int]$ThrottlingDelay = 0,
+
+    [Parameter(Mandatory=$false,HelpMessage="The BatchSize parameter specifies how many items to delete within a batch request.")]
+    [ValidateRange(1,20)][int]$BatchSize=20
 )
 
 begin {
@@ -968,7 +974,7 @@ begin {
             $GetFolderListParams.Add("Query","users/$Mailbox/mailFolders/RecoverableItemsRoot/childfolders/?includeHiddenFolders=true")
         }
         else {
-            $GetFolderListParams.Add("Query","users/$Mailbox/mailFolders")
+            $GetFolderListParams.Add("Query","users/$Mailbox/mailFolders/delta")
         }
         $FolderResults = Invoke-GraphApiRequest @GetFolderListParams
     
@@ -990,13 +996,20 @@ begin {
             foreach ($includedFolder in $IncludeFolderList) {
                 $folder = GetFolder -IncludeFolder $includedFolder
                 if($folder) {
+                    Write-Verbose "Adding the folder $($folder.displayName) to the list of folders to query."
                     $Script:SearchFolderList.Add($folder) | Out-Null
                 }
             }
+            # Find subfolders for the specified folders
             if($ProcessSubfolders){
                 foreach($folder in $FolderList){
-                    if($folder.parentFolderId -eq $Script:ParentFolder) {
-                        $Script:SearchFolderList.Add($folder) | Out-Null
+                    # Folder can be multiple levels deep subfolder
+                    foreach($foundFolder in $Script:SearchFolderList){
+                        if($folder.parentFolderId -eq $foundFolder.Id) {
+                            Write-Verbose "Adding the folder $($folder.displayName) to the list of folders to query."
+                            $Script:SearchFolderList.Add($folder) | Out-Null
+                            break
+                        }
                     }
                 }
             }
@@ -1004,14 +1017,33 @@ begin {
         else {
             $Script:SearchFolderList = $FolderList
         }
-        
+        $tempFolderList = New-Object System.Collections.ArrayList
+        # Check for folders that need to be excluded from search queries
         if($ExcludeFolderList) {
             foreach($excludedFolder in $ExcludeFolderList){
                 $folder = GetFolder -IncludeFolder $excludedFolder
                 if($folder) {
-                    $Script:SearchFolderList.Remove($folder)
+                    Write-Verbose "Adding the $($folder.displayName) to list of folders to be removed."
+                    $tempFolderList.Add($folder) | Out-Null
+                    if($ExcludeSubfolders) {
+                        # Remove any subfolders of the excluded folder from the list
+                        foreach($foundFolder in $Script:SearchFolderList){
+                            foreach($tempFolder in $tempFolderList) {
+                                if($foundFolder.parentFolderId -eq $tempFolder.Id){
+                                    Write-Verbose "Adding the $($foundFolder.displayName) to list of folders to be removed."
+                                    $tempFolderList.Add($foundFolder) | Out-Null
+                                    break
+                                }
+                            }
+                        }
+                    }
                 }
             }
+            # Remove the excluded folders from the list
+            foreach($folder in $tempFolderList) {
+                $Script:SearchFolderList.Remove($folder) | Out-Null
+            }
+            
         }
     }
     
@@ -1243,8 +1275,35 @@ end {
 
     if($DeleteContent) {
         $Script:Token = CheckTokenExpiry -Token ([ref]$Script:GraphToken) -ApplicationInfo $applicationInfo -AzureADEndpoint $azureADEndpoint -AuthScope $Script:GraphScope
-        foreach($item in $Script:SearchResults) {
-            Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query "users/$Mailbox/messages/$($item.id)" -AccessToken $Script:Token -Method DELETE | Out-Null
+        [int]$itemsDeleted = 0
+        # Make sure the results are not less than the batch size
+        if($Script:SearchResults.count -lt $BatchSize){
+            $BatchSize = $Script:SearchResults.Count
+        }
+        $Query = "`$batch"
+        # Loop thru the results creating batches to delete
+        while($itemsDeleted -lt $Script:SearchResults.Count){
+            # Make sure the batch size is not greater than the items left to process
+            if(($Script:SearchResults.Count - $itemsDeleted) -lt $BatchSize){
+                $BatchSize = $Script:SearchResults.Count - $itemsDeleted
+            }
+            #region CreateBatch
+            $requests = New-Object System.Collections.ArrayList
+            for($x=0; $x -lt $BatchSize; $x++){
+                $request = @{
+                    Id          = $x+1
+                    Method      = "DELETE"
+                    Url         = "/users/$($Mailbox)/messages/$($Script:SearchResults[$itemsDeleted].id)"
+                }
+                $requests += $request
+                $itemsDeleted++
+            }
+            $batchRequest = @{
+                Requests = $requests
+            } | ConvertTo-Json -Depth 6
+            #endregion
+            Write-Verbose "Sending request for the next batch of deletions."
+            Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest | Out-Null
         }
     }
 }
@@ -1252,8 +1311,8 @@ end {
 # SIG # Begin signature block
 # MIIoLAYJKoZIhvcNAQcCoIIoHTCCKBkCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDW9F9Ym+hjRk4+
-# Wyop350Qej7OMkqu6ok1yrO0TgOp5qCCDXYwggX0MIID3KADAgECAhMzAAAEBGx0
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBJCULIQ1iaz4Bm
+# mwm6rUrvvzs5epkFohUkXh7lY4tP0aCCDXYwggX0MIID3KADAgECAhMzAAAEBGx0
 # Bv9XKydyAAAAAAQEMA0GCSqGSIb3DQEBCwUAMH4xCzAJBgNVBAYTAlVTMRMwEQYD
 # VQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNy
 # b3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNpZ25p
@@ -1330,62 +1389,62 @@ end {
 # aWNyb3NvZnQgQ29ycG9yYXRpb24xKDAmBgNVBAMTH01pY3Jvc29mdCBDb2RlIFNp
 # Z25pbmcgUENBIDIwMTECEzMAAAQEbHQG/1crJ3IAAAAABAQwDQYJYIZIAWUDBAIB
 # BQCggbAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEO
-# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEICs/QqyN29/9hEX0xz9cmYcn
-# PdY/9MHhsvQ0PBYOS6cFMEQGCisGAQQBgjcCAQwxNjA0oBSAEgBNAGkAYwByAG8A
+# MAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIIOXj2/S7SA9AQp4Z9xQdk3a
+# wBYl+lDrDZGCiWnsZohhMEQGCisGAQQBgjcCAQwxNjA0oBSAEgBNAGkAYwByAG8A
 # cwBvAGYAdKEcgBpodHRwczovL3d3dy5taWNyb3NvZnQuY29tIDANBgkqhkiG9w0B
-# AQEFAASCAQBVH3lrk+Gto/vD+p4EEbvSjl4Q3tHgEkkVrjH6DyGUVGuJHuCnxnIM
-# kOD0WY4gFtN3ZkZ0KdWuJNJNAT/CTPIZ1NBjSYaWaBruYRbQ+YXq86ruU1BvFSLm
-# fPUzIqQ0SHchspqVttIMZzM+IdtOtpZkwtYGfSfpWG05cI91C9iEvHi4OCgAbxjK
-# 79mLK3ypA+aqzYcvG+VBkKHfGtF0Iz/JYLetSQYoWBz8MstfiyMH5oPnUz62IU2d
-# sofHFpzzKfHtP7ztpH3jmp+FdOejK9ft6kAKCP3+Hi9wZ37y724dy7kXUAdkdIIi
-# d7an4rj/B8gYQB9a7CQfjE9PVLqUuGJ9oYIXlDCCF5AGCisGAQQBgjcDAwExgheA
+# AQEFAASCAQCosAT0olgHE9QiBXISTGVr3T5vwbW6worSAyopz/d8vxr9N9yxK25Z
+# ixgyUGniQw/uxCY6djsIXgvz/ubdcaYtcRfO05dC3IJFpKzfbcFTnC9ioAc0toMP
+# Xn4u0ze3Wgf4xCiRT16BeMG8NVRKPKP4vATDqy/blp02t0d2hl8y1Z0VWUWYm0qJ
+# Kh32cqsydYntMsR2kxf7pDQ2pXtLOylPW3Xw+B/kTBadcIT6V3Nnt+jWc+C7XC0g
+# MdWM0wWVxyt/iit9Mk36QcrTRMcop4rffmWPkShGWZSW1zmxvygZkonWdV3TDrAY
+# jJWmPfoiH234k7swOU5fVi4a8n4FvsJ4oYIXlDCCF5AGCisGAQQBgjcDAwExgheA
 # MIIXfAYJKoZIhvcNAQcCoIIXbTCCF2kCAQMxDzANBglghkgBZQMEAgEFADCCAVIG
 # CyqGSIb3DQEJEAEEoIIBQQSCAT0wggE5AgEBBgorBgEEAYRZCgMBMDEwDQYJYIZI
-# AWUDBAIBBQAEIGoybEnbvZDBf6KNc921azrgHOCRWrImmWh0XInriBnrAgZnGn9n
-# +DcYEzIwMjQxMTEyMTQzMDA1LjM5OFowBIACAfSggdGkgc4wgcsxCzAJBgNVBAYT
+# AWUDBAIBBQAEIHqtV3kmup+guFHatFVBnT1uGjRG8N+czd/0eTyUC3ryAgZnGnbZ
+# tyIYEzIwMjQxMTEzMTQzNTA3LjIwM1owBIACAfSggdGkgc4wgcsxCzAJBgNVBAYT
 # AlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYD
 # VQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xJTAjBgNVBAsTHE1pY3Jvc29mdCBB
-# bWVyaWNhIE9wZXJhdGlvbnMxJzAlBgNVBAsTHm5TaGllbGQgVFNTIEVTTjo4NjAz
-# LTA1RTAtRDk0NzElMCMGA1UEAxMcTWljcm9zb2Z0IFRpbWUtU3RhbXAgU2Vydmlj
-# ZaCCEeowggcgMIIFCKADAgECAhMzAAAB8bNF9SfowBbWAAEAAAHxMA0GCSqGSIb3
+# bWVyaWNhIE9wZXJhdGlvbnMxJzAlBgNVBAsTHm5TaGllbGQgVFNTIEVTTjpBOTM1
+# LTAzRTAtRDk0NzElMCMGA1UEAxMcTWljcm9zb2Z0IFRpbWUtU3RhbXAgU2Vydmlj
+# ZaCCEeowggcgMIIFCKADAgECAhMzAAAB6Q9xMH5d8RI2AAEAAAHpMA0GCSqGSIb3
 # DQEBCwUAMHwxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYD
 # VQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xJjAk
 # BgNVBAMTHU1pY3Jvc29mdCBUaW1lLVN0YW1wIFBDQSAyMDEwMB4XDTIzMTIwNjE4
-# NDU1NVoXDTI1MDMwNTE4NDU1NVowgcsxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpX
+# NDUyNloXDTI1MDMwNTE4NDUyNlowgcsxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpX
 # YXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRtb25kMR4wHAYDVQQKExVNaWNyb3NvZnQg
 # Q29ycG9yYXRpb24xJTAjBgNVBAsTHE1pY3Jvc29mdCBBbWVyaWNhIE9wZXJhdGlv
-# bnMxJzAlBgNVBAsTHm5TaGllbGQgVFNTIEVTTjo4NjAzLTA1RTAtRDk0NzElMCMG
+# bnMxJzAlBgNVBAsTHm5TaGllbGQgVFNTIEVTTjpBOTM1LTAzRTAtRDk0NzElMCMG
 # A1UEAxMcTWljcm9zb2Z0IFRpbWUtU3RhbXAgU2VydmljZTCCAiIwDQYJKoZIhvcN
-# AQEBBQADggIPADCCAgoCggIBALG6UJm20h/xf3utb38n5DhWD0+K6AHXJrX8NHHE
-# tbaHDLhCC1TePl9XvlkprpdNNCFbkKWQaXqCnWd3lUGzHglv6hTg+wwDZ+h7yA/1
-# tA09XEgcwm7pNhyuuff0d1163bGR2pSHPPJJdo8WoUyTZWJ8R+P4dHomF42zYsvO
-# bwUMmb6kF108MtqD9H4A8hYfJ+2r2K3AzRY/lnR19DIjhaVV5RL6+i2w9tab5Eqw
-# fgVA2HNvS38PiK61x8Irf8sr7EuZLp2YCHsAwq4RSXyLaR1YENFxz4lZrbVIJ5/H
-# lI+EkQWBiF0Y8CincbWXxPfdyqtsu1wUmrDDhNCJiIKR3KwJycgXRmpI0Adx8j1I
-# C/eB+TLGpA0knexOyDkY9EX3maqBt9BuQWdTXuJhtEg8mrCBIuHIHzfdkOCbPFsq
-# YmZ0NptvNLTIaGeAdrr6DBVo5Spwd/3DqTDEyj46obdBkhzB3nAcQKzmsAlno8jI
-# UzsB3aFFQUdFOLfncjtXjESBga5lvqoXHo9/jiLsCNdum1SiUNxXNgR2AtBJaK4V
-# qNLpeDeTsLLxOIzkc9Qr0tkieWhPG5QtLEmYnudONSM6PnHBGYLvHZL+bGqXye8d
-# II3U4QPb/AQI6i3owR71svefOgrA7xM2URK2rmxx3bkYDSAxA76o1dX/FMM4FMnz
-# MFwZAgMBAAGjggFJMIIBRTAdBgNVHQ4EFgQUvLbF7n2wITRKPJyoTkStvhitLWAw
+# AQEBBQADggIPADCCAgoCggIBAKyajDFBFWCnhNJzedNrrKsA8mdXoDtplidPD/LH
+# 3S7UNIfz2e99A3Nv7l+YErymkfvpOYnOMdRwiZ3zjkD+m9ljk7w8IG7sar7Hld7q
+# mVC3jHBVRRxAhPGSU5nVGb18nmeHyCfE7Fp7MUwzjWwMjssykrAgpAzBcNy1gq8L
+# JDLqQ7axUsHraQXz3ZnBximIhXHctPUs90y3Uh5LfkpjkzHKVF1NLsTUmhyXfQ2B
+# wGIl+qcxx7Tl4SKkixM7gMif/9O0/VHHntVd+8I7w1IKH13GzK+eDSVRVj66ur8b
+# xBEWg6X/ug4jRF/xCD7eHJhrIewj3C28McadPfQ2vjXHNOnDYjplZoiE/Ay7kO92
+# QQbNXu9hPe1v21O+Jjemy6XVPkP3fz8B80upqdUIm0/jLPRUkFIZX6HrplxpQk7G
+# ltIiMiZo4sXXw06OZ/WfANq2wGi5dZcUrsTlLRUtHKhOoMLEcbiZbeak1Cikz9TV
+# YmeOyxZCW4rx5v4wMqWT0T+E4FgqzYp95Dgcbt05wr7Aw5qYZ/C+Qh7t2TKXObwF
+# 4BRALwvGsBDKSFIfL4VpD3cMCV9BijBgO3MZeoTrA4BN4oUjfS71iXENPMC4sMrT
+# vdyd0xXipoPd65cDrFQ0KjODuuKGIdRozjcCZv0Qa5GXTbb7I/ByWbKSyyTfRrhG
+# ne/1AgMBAAGjggFJMIIBRTAdBgNVHQ4EFgQUkX4zicUIdiO4iPRa6/6NyO0H7E4w
 # HwYDVR0jBBgwFoAUn6cVXQBeYl2D9OXSZacbUzUZ6XIwXwYDVR0fBFgwVjBUoFKg
 # UIZOaHR0cDovL3d3dy5taWNyb3NvZnQuY29tL3BraW9wcy9jcmwvTWljcm9zb2Z0
 # JTIwVGltZS1TdGFtcCUyMFBDQSUyMDIwMTAoMSkuY3JsMGwGCCsGAQUFBwEBBGAw
 # XjBcBggrBgEFBQcwAoZQaHR0cDovL3d3dy5taWNyb3NvZnQuY29tL3BraW9wcy9j
 # ZXJ0cy9NaWNyb3NvZnQlMjBUaW1lLVN0YW1wJTIwUENBJTIwMjAxMCgxKS5jcnQw
 # DAYDVR0TAQH/BAIwADAWBgNVHSUBAf8EDDAKBggrBgEFBQcDCDAOBgNVHQ8BAf8E
-# BAMCB4AwDQYJKoZIhvcNAQELBQADggIBAOFISNIEVIJsnKXdT9CYUxbZ4s8GSeeW
-# x8gP/uBMy8A0SeGrTwj0cdtuqLCoMQdK8BG8q0vuPTOcgJgFsytVKa+APFTyMAao
-# zKIugzzTvzxKjf5PohlX/9RlEmoGXigzdsIhCAUajRVN5DpHNgv63XMJReaak+Yz
-# jFxJxUUBNePlPHsHLhKFZQLtWGbumJwOJTmKAaO6K9GHE+9ul+VuH9uyITm3Hly4
-# 4kQlIb65ZyoHJHtMLhwa+5q8dKOTWJFdP9CNo4R4mg6d96xs528msl1ub6V5gtEj
-# rs3dx3wH+y5TbW1F2DA6dOTaE65kqz+QvBpfo2wBtTL2kqwOZPKhacabJNYE+JNv
-# aunmiCjxjyExTVhCzusdHmGqKUSrzyMX70fwpxxv/WKyYlMacGdEy/rxR3aXksWE
-# 5nidG2XiUeuL43UvwQGDtoTwS897wJr2DPyyHYXgI5Nh3U8dx7W6Au+9ZbX5o5Kl
-# 3w2fASJ3jOAPv1lDGKwmrI7iUxYzMCAR4WFSbjQWyG3Ne50CxfkugKKXistsd/Bi
-# 0Y6nD0NVfeNcBX3S0b2JFtyqO23e+Fb1P4vd8BmUx6tpZ+Ht5SY+W0xTyURA4x6W
-# j/V6GQgY7thk4fFSp4qmYX1BpbwtdNPT3QAdniTqD612lkV8Iyi3Ib4Theo3pla0
-# oQFCITfEvbsEMIIHcTCCBVmgAwIBAgITMwAAABXF52ueAptJmQAAAAAAFTANBgkq
+# BAMCB4AwDQYJKoZIhvcNAQELBQADggIBAFaxKn6uazEUt7rUAT3Qp6fZc+BAckOJ
+# LhJsuG/N9WMM8OY51ETvm5CiFiEUx0bAcptWYsrSUdXUCnP8dyJmijJ6gC+QdBoe
+# YuHAEaSjIABXFxppScc0hRL0u94vTQ/CZxIMuA3RX8XKTbRCkcMS6TApHyR9oERf
+# zcDK9DOV/9ugM2hYoSCl0CwvxLMLNcUucOjPMIkarRHPBCB4QGvwTgrbBDZZcj9k
+# nFlL/53cV3AbgSsEXPNSJJtXabfGww/dyoJEUO0nULf8meNcwKGeb1ssMPXBontM
+# +nnBh2/Q6X35o3S3UGY7MKPwOaoq5TDOAIr1OO3DkpSNo7pCN6AfOd1f+1mtjv3Z
+# 19EBevl0asqSmywgerqutY7g+Uvc5L7hyIv+Xymb6g0ldYZdgkvkfos2crJclUTD
+# /UVs7j4bP5Th8UXGzZLxTC+sFthxxVD074WWPvFMB4hMmwem0C9ESoJz79jHOEgq
+# QDzxDxCEkpQO1rNq0kftk52LQsIrCCpA7gfzUpkYNIuS0W81GGHxkEB6efWlb7lQ
+# EZjPYamBzFVcpPUK5Rh2UdH0Po2tWEap2EZODs6D93/ygyU8bdiO6oXGJ2IiygDD
+# b4yEjXNesiLnq3omQnvknr0X6WSH2bIkmk2THjWxIHVcraMlaCrtWUG4/UG5eNne
+# qDKb2vXC/Qy1MIIHcTCCBVmgAwIBAgITMwAAABXF52ueAptJmQAAAAAAFTANBgkq
 # hkiG9w0BAQsFADCBiDELMAkGA1UEBhMCVVMxEzARBgNVBAgTCldhc2hpbmd0b24x
 # EDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1pY3Jvc29mdCBDb3Jwb3JhdGlv
 # bjEyMDAGA1UEAxMpTWljcm9zb2Z0IFJvb3QgQ2VydGlmaWNhdGUgQXV0aG9yaXR5
@@ -1428,41 +1487,41 @@ end {
 # A00wggI1AgEBMIH5oYHRpIHOMIHLMQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2Fz
 # aGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0IENv
 # cnBvcmF0aW9uMSUwIwYDVQQLExxNaWNyb3NvZnQgQW1lcmljYSBPcGVyYXRpb25z
-# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046ODYwMy0wNUUwLUQ5NDcxJTAjBgNV
+# MScwJQYDVQQLEx5uU2hpZWxkIFRTUyBFU046QTkzNS0wM0UwLUQ5NDcxJTAjBgNV
 # BAMTHE1pY3Jvc29mdCBUaW1lLVN0YW1wIFNlcnZpY2WiIwoBATAHBgUrDgMCGgMV
-# APufsGTiCwza1tT+L4zcG1GcuPT3oIGDMIGApH4wfDELMAkGA1UEBhMCVVMxEzAR
+# AKtph/XEOTasydT9UmjYYYrWfGjxoIGDMIGApH4wfDELMAkGA1UEBhMCVVMxEzAR
 # BgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1JlZG1vbmQxHjAcBgNVBAoTFU1p
 # Y3Jvc29mdCBDb3Jwb3JhdGlvbjEmMCQGA1UEAxMdTWljcm9zb2Z0IFRpbWUtU3Rh
-# bXAgUENBIDIwMTAwDQYJKoZIhvcNAQELBQACBQDq3WA6MCIYDzIwMjQxMTEyMDUw
-# MzU0WhgPMjAyNDExMTMwNTAzNTRaMHQwOgYKKwYBBAGEWQoEATEsMCowCgIFAOrd
-# YDoCAQAwBwIBAAICBvEwBwIBAAICFEgwCgIFAOresboCAQAwNgYKKwYBBAGEWQoE
+# bXAgUENBIDIwMTAwDQYJKoZIhvcNAQELBQACBQDq3qkPMCIYDzIwMjQxMTEzMDQy
+# NjU1WhgPMjAyNDExMTQwNDI2NTVaMHQwOgYKKwYBBAGEWQoEATEsMCowCgIFAOre
+# qQ8CAQAwBwIBAAICHzYwBwIBAAICEzwwCgIFAOrf+o8CAQAwNgYKKwYBBAGEWQoE
 # AjEoMCYwDAYKKwYBBAGEWQoDAqAKMAgCAQACAwehIKEKMAgCAQACAwGGoDANBgkq
-# hkiG9w0BAQsFAAOCAQEASpTew2CaH5kPfOZppRafUQaLyKeHZaLEAbsAw6qYnAsm
-# H9I214hMgFtfOvPxpqeBQesFOLqI0irHdTY9iLHTnu7CK7cd4BRnATX17Ydn8Icn
-# n71YK0HSZz+4jTpT+orVYx2qM3E5x5OcgV5Q3vAXWGQo/poyM07/3yXP2HUibEWV
-# L4f228SZ3x56T1dfQfHblWiNS6t84cFLpKEgPxbXQJZ4MCPToQzNheAUt/jCv2ZD
-# YeSb+MTAwo+/hZAqbHECai7Cu9NQFw8/wuR2IfgDssJDu1vZgcMRq9GpFBRsQZi8
-# Kt0JzWvrR2H6rY2zBmUhXcNtOd+ykL/I4vCr/L0DTDGCBA0wggQJAgEBMIGTMHwx
+# hkiG9w0BAQsFAAOCAQEAI+nMuQYnwutbtzqrfbYtslGshQ6vTgfZvtVSLfPTIlBq
+# oWlERuU5UqinAXrhdi3yGpA5lc+cBGQwkK6NTxz3uLqYBuSN5DtFXkS/j4N3CtHP
+# lXdGjfQN19fxE6KzRxsB4yI2DfsTuWrYTlHvGG7B4aKtXz2D9ZEU7qUxOz3ETPdo
+# ZyiYbAc5S5J1a1ePyhlBfM3jGcqSRV41/zrcVA668nrlgraF6uwwtr6cMjHQMljx
+# O0W5DIkxPMhptKFgCIAbNI0mV7VIwdLZFD2tL8tdOF83g6ttMXar5b6ArfYvPLZm
+# exwRNHxOoarN0dQUFLTsxDIkO0/WPFK4mJPl0T/XhjGCBA0wggQJAgEBMIGTMHwx
 # CzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdSZWRt
 # b25kMR4wHAYDVQQKExVNaWNyb3NvZnQgQ29ycG9yYXRpb24xJjAkBgNVBAMTHU1p
-# Y3Jvc29mdCBUaW1lLVN0YW1wIFBDQSAyMDEwAhMzAAAB8bNF9SfowBbWAAEAAAHx
+# Y3Jvc29mdCBUaW1lLVN0YW1wIFBDQSAyMDEwAhMzAAAB6Q9xMH5d8RI2AAEAAAHp
 # MA0GCWCGSAFlAwQCAQUAoIIBSjAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# LwYJKoZIhvcNAQkEMSIEIIc/orn/4ZrOPSYP+wkuVxx74at6JBeE+wLBYrXFQGXx
-# MIH6BgsqhkiG9w0BCRACLzGB6jCB5zCB5DCBvQQg1Xf9PmFLuKPBqjjrpGiwHvDA
-# SJu3RrU/kSojASP2EXgwgZgwgYCkfjB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMK
+# LwYJKoZIhvcNAQkEMSIEILisALFDvr1L5+RUAc96uU2nueArvplGNqrFkIqA/iq3
+# MIH6BgsqhkiG9w0BCRACLzGB6jCB5zCB5DCBvQQgpJCSeJdpNyaPVMpBYX7HZTiu
+# JWisYPxPCaBVs32qxCUwgZgwgYCkfjB8MQswCQYDVQQGEwJVUzETMBEGA1UECBMK
 # V2FzaGluZ3RvbjEQMA4GA1UEBxMHUmVkbW9uZDEeMBwGA1UEChMVTWljcm9zb2Z0
 # IENvcnBvcmF0aW9uMSYwJAYDVQQDEx1NaWNyb3NvZnQgVGltZS1TdGFtcCBQQ0Eg
-# MjAxMAITMwAAAfGzRfUn6MAW1gABAAAB8TAiBCCCPECJjW1SeTvYTv7d8unsgS+o
-# LCA3RO/8Y3w64jZdaDANBgkqhkiG9w0BAQsFAASCAgBP2wWIuk8w8ztCBArLa3Dm
-# 4ke/ODUWDdCwVizhbxQxeWCUPpK2QHDhwLsZEUMjJV4ws8sOUmjs8f9c7SYZatZZ
-# n9rW3njiHwAZ9dcyFdO6RfrLezsqP14GYvvTFNI15HBwmEJ7sT8js1w40xfUbXAh
-# WY15dEkzv++EDfNxBT9iQpskVvGkEnyqBM8WrdmNTD6FWHzDiQEj2RBzpUgo6J5R
-# uWpv/vYDSqg/lAU6K9DrKVeAdWCZjHTZGmY9pSpjI6EdddW5ZBOyad22H7oFOZTP
-# XjwnVf+83zaI2ryPUsARmKMaxAi4nSPQrlTPBLAD6ZGlTwZfpMdXG4gp4UFU/DPp
-# tERGvIRn0kmPagKZKGcy8IWwpuJ8ED9GN8lFcI+vIeS2f6opeEhZsZuDMfN1D/Tf
-# uKjozkmJrGWLfKl8c7SQ5Skv119mybmJXBv8sxEcv8ncQKLJcZj9ktItUEw3gngq
-# 2A9RZvZgLmgiOWeeY2KhWZWDqV661AljO/ThkuexQ5x6/aftZ2msivBPyBjr5ZeY
-# 3b3x6PxBgktR4nCagkChcw2V7chymIjbjb4qCr9T2nQeJOk3Kfu+BphO4gsTEBW6
-# 4PGVxduiV18Ft144wNsP1BpREYe2lRvkDUcQewM7oUD15My9AnctYxf+f7uTTNhq
-# VTmFGERpy/QSVxt7NRf3qg==
+# MjAxMAITMwAAAekPcTB+XfESNgABAAAB6TAiBCCPSHU21DLs9At0Nn73knQyC1Vq
+# otA1+6uu34o2UkfduTANBgkqhkiG9w0BAQsFAASCAgAkrzRmozBkBgjPOLUkK9/2
+# xwJGcdOxKRWsY1d/6D0cuq8P9IisO43e7WPw6o4sQqXbMUEOANhlyuwcROKbMLP5
+# xkU3cMbzAVDihJRad4kyruLoZOMRH5Ru5Qrg6m0l651cPhpLBQFV19AzoDm0VXcX
+# JbeFHRvDqATEMmuyZKXZR+BCEZfdm/Jf5V0QUs8pVlg7Am9H2DFBEAT/+JbW10rC
+# J08Nbt4XfTa4SDOHr1TkHjK83CsiaBBvqNCGS0/DPtC6JeFn+xFuk5DZOcCTE+97
+# 4ZsS/xpA+CiZz9jVBMDdhPr+Y8hBBKlTRGgrVyjcmO66I67uYoHSkV3BoCQcec4D
+# fJtccn2Mw6V53qmjSTLHPMqfXljTJJDEKTkPssjzP2wGqnt38e2MiE3WYxfDhq6U
+# vrRT4dJ/X7qlhRfvOwXOyzxOtTr6qTJhU5D86fYoLPpLCE/hFpDq5f86K7Dlk7aw
+# Ji/G0cEH8ePXeSJwBCr//Q5D9hQc/eTCTIs7t5TsreuaC8YgWgddA2EP48o0mka1
+# 0qHgwjXIZ1E9R4/VqZqvLuHtakCQdUQiglKoR4YmWyhjgs9CYXUgp+B8qk8Nltdf
+# FUks2uQu/T8dz7fklFpbrsMDmsG8DA8qodM4rIjtUX21UY+Dr8VeCUBXS8lKTQAF
+# WY+Qo7H3HCwmIM+E+GmhhA==
 # SIG # End signature block
