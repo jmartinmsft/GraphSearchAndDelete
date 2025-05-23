@@ -54,6 +54,8 @@ Search the recoverable items for items within a date range and delete those item
 
 **DeleteContent** - The DeleteContent parameter is a switch to delete the items found in the search results (moved to Deleted Items).
 
+**HardDelete** The HardDelete parameter is a switch to hard-delete the items found in the search results
+
 **AzureEnvironment** - The AzureEnvironment parameter specified the Azure environment for the tenant.
 
 **PermissionType** - The PermissionType parameter specifies whether the app registrations uses delegated or application permissions.
