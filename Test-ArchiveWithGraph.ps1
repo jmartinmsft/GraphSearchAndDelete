@@ -41,6 +41,9 @@ param (
     [Parameter(Mandatory=$False, HelpMessage="The ExcludeFolderList parameter specifies the folder(s) to be excluded (these folders will not be searched).")]
     $ExcludeFolderList,
 
+    [Parameter(Mandatory=$false,HelpMessage="The SearchDumpster parameter is a switch to search the recoverable items.")] 
+    [switch]$SearchDumpster,
+    
     [ValidateSet("Global", "USGovernmentL4", "USGovernmentL5", "ChinaCloud")]
     [Parameter(Mandatory = $false)]
     [string]$AzureEnvironment = "Global",
@@ -1179,6 +1182,56 @@ function BuildFolderListTree{
     }
 }
 
+function GetRecoverableItemsFolderList{
+    Write-Host "Getting a list of folders in the recoverable items..." -ForegroundColor Cyan -NoNewline
+    $Global:folderList = New-Object System.Collections.ArrayList
+    [string]$Query = "users/$ArchiveMailbox/mailFolders/RecoverableItemsRoot/childfolders/?includeHiddenFolders=true"
+
+    $params = @{
+        AccessToken         = $Script:Token
+        GraphApiUrl         = $cloudService.graphApiEndpoint
+        Query               = $Query
+    }
+
+    $Global:FolderResults = Invoke-GraphApiRequest @params
+
+    foreach($Result in $FolderResults.Content.Value){
+        $Global:folderList.Add($Result) | Out-Null
+    }    
+    while($null -ne $FolderResults.Content.'@odata.nextLink'){
+        $Query = $FolderResults.Content.'@odata.nextLink'.Substring($FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+        $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+        foreach($Result in $FolderResults.Content.Value){
+            $Global:folderList.Add($Result) | Out-Null
+        }
+    }
+
+    #get subfolders
+    foreach($folder in $Global:folderList){
+        $Query = "users/$ArchiveMailbox/mailFolders/$($folder.id)/childfolders/?includeHiddenFolders=true"
+        $params = @{
+            AccessToken         = $Script:Token
+            GraphApiUrl         = $cloudService.graphApiEndpoint
+            Query               = $Query
+        }
+
+        $FolderResults = Invoke-GraphApiRequest @params
+
+        foreach($Result in $FolderResults.Content.Value){
+            $Global:folderList.Add($Result) | Out-Null
+        }    
+        while($null -ne $FolderResults.Content.'@odata.nextLink'){
+            $Query = $FolderResults.Content.'@odata.nextLink'.Substring($FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+            $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+            foreach($Result in $FolderResults.Content.Value){
+                $Global:folderList.Add($Result) | Out-Null
+            }
+        }
+    }
+    Write-Host " Done. $($Global:folderList.Count) folders found." -ForegroundColor Green
+}
+
+
 $cloudService = Get-CloudServiceEndpoint $AzureEnvironment
 $azureADEndpoint = $cloudService.AzureADEndpoint
 $Script:applicationInfo = @{
@@ -1204,15 +1257,27 @@ $Global:MailboxSettings = Invoke-GraphApiRequest @params
 $ArchiveMailbox = $MailboxSettings.Content.inPlaceArchiveMailboxId
 Write-Host "Attempting to connect to archive mailbox $($ArchiveMailbox)"
 
-GetFolderList
+if(-not($SearchDumpster)){
+    GetFolderList
+}
+
+else{
+    GetRecoverableItemsFolderList
+}
 
 #Determine the folder to search
 Write-Host "Determining folders to search..." -ForegroundColor Cyan
 $Global:searchFolders = New-Object System.Collections.ArrayList
+
 if([string]::IsNullOrEmpty($IncludeFolderList)){
     #If no include list is specified, search the entire archive
-    $Global:searchFolders = $Script:folderListTree
-    Write-Host "No include folder list specified. The entire archive will be searched." -ForegroundColor Yellow
+    if($SearchDumpster){
+        $Global:searchFolders = $Global:folderList
+    }
+    else {
+        $Global:searchFolders = $Script:folderListTree
+        Write-Host "No include folder list specified. The entire archive will be searched." -ForegroundColor Yellow
+    }
 }
 else {
     Write-Host "Building list of folders to be searched based on the include folder list..." -ForegroundColor Cyan
@@ -1263,7 +1328,7 @@ if($ExcludeFolderList){
 #Do we need to have exclude subfolders?
 Write-Host "Final list of folders to be searched:" -ForegroundColor Cyan
 $Global:searchFolders | Format-Table displayName
-
+exit
 SearchMailbox
 
 Write-Host ([string]::Format("{0} item(s) found in the search results...", $Script:SearchResults.Count)) -ForegroundColor Green
