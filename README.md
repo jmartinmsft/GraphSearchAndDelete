@@ -25,6 +25,10 @@ Search the recoverable items for items within a date range and delete those item
 ```powershell
 .\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -CreatedAfter 2024-01-01 -CreatedBefore 2024-01-31 -SearchDumpster -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 ```
+Search the archive mailbx (including aux archive mailboxes) for items containing the subject Graph from sender shared@contoso.com that were sent before a date in the GraphArchive folder
+```powershell
+.\Graph-SearchAndDelete.ps1 -OAuthClientId 7fc9c210-fa39-4c7a-83b8-9c6970b3c16a -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthCertificate 7765BEC834A02110DF8686D13436ABC8BE265917 -CertificateStore CurrentUser -PermissionType Application -Mailbox jim@contoso.com -Archive -IncludeFolderList GraphArchive -CreatedBefore (Get-Date -Date '7/23/2026') -Sender shared@contoso.com -Subject Graph
+```
 
 ## Parameters
 
