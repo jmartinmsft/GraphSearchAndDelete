@@ -30,13 +30,13 @@ Search the recoverable items for items within a date range and delete those item
 
 **Mailbox** - The Mailbox parameter specifies the mailbox to be accessed
 
+**Archive** - The Archive parameter is a switch to search the archive mailbox (otherwise, the main mailbox is searched).
+
 **ProcessSubfolders** - The ProcessSubfolders parameter is a switch to enable searching the subfolders of any specified folder
 
-**IncludeSubfolders** - The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the Inbox folder will be searched).  Any exclusions override this list.
+**IncludeFolderList** - The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the Inbox folder will be searched).  Any exclusions override this list.
 
 **ExcludeFolderList** - The ExcludeFolderList parameter specifies the folder(s) to be excluded (these folders will not be searched).
-
-**ExcludeSubfolders** - The ExcludeSubfolders parameter is a switch to prevent searching the subfolders of the ExcludeFolderList.
 
 **SearchDumpster** - The SearchDumpster parameter is a switch to search the recoverable items.
 
@@ -49,8 +49,6 @@ Search the recoverable items for items within a date range and delete those item
 **Sender** - The Sender paramter specifies the sender email address used by the search.
 
 **MessageBody** - The MessageBody parameter specifies the body string used by the search.
-
-**MessageId** - The MessageId parameter specified the MessageId used by the search.
 
 **DeleteContent** - The DeleteContent parameter is a switch to delete the items found in the search results (moved to Deleted Items).
 
@@ -72,8 +70,10 @@ Search the recoverable items for items within a date range and delete those item
 
 **CertificateStore** - The CertificateStore parameter specifies the certificate store where the certificate is loaded.
 
+**Scope** - The Scope parameter specifies the API permissions
+
 **OutputPath** - The OutputPath parameter specifies the path for the EWS usage report.
 
-**ThrottlingDelay** - The ThrottlingDelay parameter specifies the throttling delay (time paused between sending EWS requests) - note that this will be increased automatically if throttling is detected"
+**LogFile** - The LogFile parameter specifies the full path for the script log file. If not specified, a log file is created in the OutputPath.
 
 **BatchSize** - The BatchSize parameter specifies how many items to delete within a batch request.

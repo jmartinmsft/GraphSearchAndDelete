@@ -52,10 +52,10 @@ param (
     [string]$PermissionType="Application",
     
     [Parameter(Mandatory=$False,HelpMessage="The OAuthClientId parameter is the Azure Application Id that this script uses to obtain the OAuth token.  Must be registered in Azure AD.")] 
-    [string]$OAuthClientId="7fc9c210-fa39-4c7a-83b8-9c6970b3c16a",
+    [string]$OAuthClientId,
     
     [Parameter(Mandatory=$False,HelpMessage="The OAuthTenantId parameter is the tenant Id where the application is registered (Must be in the same tenant as mailbox being accessed).")] 
-    [string]$OAuthTenantId="9101fc97-5be5-4438-a1d7-83e051e52057",
+    [string]$OAuthTenantId,
     
     [Parameter(Mandatory=$False,HelpMessage="The OAuthRedirectUri parameter is the redirect Uri of the Azure registered application.")] 
     [string]$OAuthRedirectUri = "http://localhost:8004",
@@ -64,7 +64,7 @@ param (
     [SecureString]$OAuthClientSecret,
     
     [Parameter(Mandatory=$False,HelpMessage="The OAuthCertificate parameter is the certificate for the registered application. Certificate auth requires MSAL libraries to be available.")] 
-    [string]$OAuthCertificate="D285DC568427B1F0633A943E60CFE9366C1D2054",
+    [string]$OAuthCertificate,
   
     [Parameter(Mandatory=$False,HelpMessage="The CertificateStore parameter specifies the certificate store where the certificate is loaded.")] [ValidateSet("CurrentUser", "LocalMachine")]
      [string] $CertificateStore = "CurrentUser",
@@ -92,6 +92,10 @@ param (
     
     [Parameter(Mandatory=$False,HelpMessage="The HardDelete parameter is a switch to permanently delete the content found by the search. If not specified, the script will soft delete the items (move to Deleted Items folder).")]
     [switch]$HardDelete,
+
+    [Parameter(Mandatory = $false, HelpMessage="The BatchSize parameter specifies the number of items to process in each batch.")]
+    [ValidateRange(1, 20)]
+    [int]$BatchSize = 20,
 
     [ValidateScript({ Test-Path $_ })]
     [Parameter(Mandatory = $false, HelpMessage="The OutputPath parameter specifies the path for the EWS usage report.")]
@@ -1127,7 +1131,6 @@ function SearchMailbox {
         if($DeleteContent -and $global:folderSearchResults.count -gt 0){
             Write-Log "Deleting $($Global:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
             [int]$itemsDeleted = 0
-            $BatchSize = 5
             # Make sure the results are not less than the batch size
             if($Global:folderSearchResults.count -lt $BatchSize){
                 $BatchSize = $Global:folderSearchResults.Count
