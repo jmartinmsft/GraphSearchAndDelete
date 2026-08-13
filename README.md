@@ -6,7 +6,7 @@ Search and delete content from a user's mailbox using the Graph API.
 This script can be used to search and delete content from a mailbox. The search criteria can include sender's email address, subject, created/received time, or message body. A report is generated with a list of items that will be/are deleted from the mailbox. The Delete parameter must be included for the script to delete the items.
 
 ## Requirements
-1. The script requires an application registration in Entra ID that has the Microsoft Graph Mail.ReadWrite application permission.
+1. The script requires an application registration in Entra ID that has the Microsoft Graph Mail.ReadWrite and MailboxSettings.Read permission.
 
 ## Note
 Message body searches are limited to 275 results per folder. Multiple runs are needed to delete more than 275 items from a folder.
