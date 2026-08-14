@@ -843,6 +843,7 @@ function Invoke-GraphApiRequest {
             StatusCode = $graphApiResponse.StatusCode
             Successful = $successful
             Headers   = $graphApiResponse.Headers
+            ErrorMessage = $graphApiResponse.ErrorMessage
         }
     }
 }
@@ -885,15 +886,23 @@ function Invoke-WebRequestWithProxyDetection {
         Invoke-WebRequest @params
     } 
     catch {
-        $response = $_.Exception.Response
-        $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
-        $responseContent = ($reader.ReadToEnd() | ConvertFrom-Json)
+        #$Global:httpError = $_
+        #$response = $_.Exception.Response
+        $response = $_
+        Write-Log $response -Level DEBUG
+        #($httpError.errordetails.message | convertfrom-json).error.code
+        #($httpError.errordetails.message | convertfrom-json).error.code.message
+
+        #$reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+        #$responseContent = ($reader.ReadToEnd() | ConvertFrom-Json)
+        $Global:responseContent = ($response | ConvertFrom-Json)
         Write-Log "Response Content: $($responseContent.error.message)" -Level DEBUG
         #Write-VerboseErrorInformation
         return [PSCustomObject]@{
             ErrorCode    = $responseContent.error.code
             ErrorMessage   = $responseContent.error.message
-            StatusCode = $response.StatusCode
+            #StatusCode = $response.StatusCode
+            StatusCode = $response.Exception.Response.StatusCode
             Successful = $false
         }
     }
@@ -1108,13 +1117,17 @@ function SearchMailbox {
         }
             
         $SearchItems = Invoke-GraphApiRequest @SearchParams
+        if($SearchItems.Successful -eq $false){
+            Write-Log "Search failed for folder $($MailboxFolder.displayName). Error: $($SearchItems.ErrorMessage)" -Level WARN
+            continue
+        }
         foreach($Result in $SearchItems.Content.Value){
             $Global:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
             #$itemsInFolder++
         }
-        if($global:folderSearchResults.count -gt 0){
-            #exit
-        }
+        #if($global:folderSearchResults.count -gt 0){
+        #    #exit
+        #}
         while($null -ne $SearchItems.Content.'@odata.nextLink'){
             $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
             $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
@@ -1266,7 +1279,11 @@ function GetFolderList{
     }
 
     $Global:FolderResults = Invoke-GraphApiRequest @params
-
+    if($FolderResults.Successful -eq $false){
+        Write-Log "Unable to get a list of folders in the mailbox. Please review the error message below and re-run the script:" -Level ERROR
+        Write-Log $FolderResults.ErrorMessage -Level ERROR
+        exit
+    }
     foreach($Result in $FolderResults.Content.Value){
         $Global:folderList.Add($Result) | Out-Null
     }
@@ -1329,7 +1346,11 @@ function GetRecoverableItemsFolderList{
         Query               = $Query
     }
     $Global:FolderResults = Invoke-GraphApiRequest @params
-
+    if($FolderResults.Successful -eq $false){
+        Write-Log "Unable to get a list of folders in the recoverable items. Please review the error message below and re-run the script:" -Level ERROR
+        Write-Log $FolderResults.ErrorMessage -Level ERROR
+        exit
+    }
     foreach($Result in $FolderResults.Content.Value){
         $Global:folderList.Add($Result) | Out-Null
     }    
@@ -1393,6 +1414,11 @@ $params = @{
     Endpoint            = $Endpoint
 }
 $Global:MailboxSettings = Invoke-GraphApiRequest @params
+if($MailboxSettings.Successful -eq $false){
+    Write-Log "Unable to retrieve mailbox settings for $Mailbox. Please check the mailbox name and try again." -Level ERROR
+    Write-Log "Error details: $($MailboxSettings.ErrorMessage)" -Level ERROR
+    exit
+}
 $Script:archiveMailbox = $MailboxSettings.Content.inPlaceArchiveMailboxId
 $Script:primaryMailbox = $MailboxSettings.content.primaryMailboxId
 
