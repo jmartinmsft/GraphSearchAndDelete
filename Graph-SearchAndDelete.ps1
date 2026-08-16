@@ -1139,7 +1139,6 @@ function SearchMailbox {
         if($SearchItems.Successful -eq $false){
             Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
             Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
-            exit
             continue
         }
         foreach($Result in $SearchItems.Content.Value){
@@ -1216,7 +1215,7 @@ function SearchMailbox {
 }    
 function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
-        if([string]::IsNullOrEmpty($MessageBody) -and [string]::IsNullOrEmpty($AttachmentName)) {
+        if([string]::IsNullOrEmpty($MessageBody)) {
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
                 $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
