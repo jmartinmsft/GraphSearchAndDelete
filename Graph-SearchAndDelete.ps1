@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260729.0838
+# Version 20260815.2136
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -102,7 +102,10 @@ param (
     [string] $OutputPath,
 
     [Parameter(Mandatory = $false, HelpMessage="The LogFile parameter specifies the full path for the script log file. If not specified, a log file is created in the OutputPath.")]
-    [string] $LogFile
+    [string] $LogFile,
+
+    [Parameter(Mandatory = $false, HelpMessage="The Confirm switch specifies whether to prompt for confirmation before performing delete actions.")]
+    [boolean]$ConfirmDelete=$true
 )
 
 #region Logging
@@ -822,9 +825,14 @@ function Invoke-GraphApiRequest {
             Write-Log "Body: $Body" -Level DEBUG
             $graphApiRequestParams.Add("Body", $Body)
         }
+        if($PSVersionTable.PSVersion.Major -eq 7){
+            #Need to prevent redirection as it will fail without sending Auth header again. This is a known issue with PS7 and Invoke-WebRequest.
+            Write-Log "PSVersion is 7 or higher, setting MaximumRedirection to 0" -Level DEBUG
+            $graphApiRequestParams.Add("MaximumRedirection", 0)
+        }
 
         Write-Log "Graph API uri called: $($graphApiRequestParams.Uri)" -Level DEBUG
-        $Global:graphApiResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $graphApiRequestParams
+        $Script:graphApiResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $graphApiRequestParams
         if (($null -eq $graphApiResponse) -or
             ([System.String]::IsNullOrEmpty($graphApiResponse.StatusCode))) {
             Write-Log "Graph API request failed - no response" -Level DEBUG
@@ -886,24 +894,38 @@ function Invoke-WebRequestWithProxyDetection {
         Invoke-WebRequest @params
     } 
     catch {
-        #$Global:httpError = $_
-        #$response = $_.Exception.Response
         $response = $_
         Write-Log $response -Level DEBUG
-        #($httpError.errordetails.message | convertfrom-json).error.code
-        #($httpError.errordetails.message | convertfrom-json).error.code.message
 
-        #$reader = New-Object System.IO.StreamReader($response.GetResponseStream())
-        #$responseContent = ($reader.ReadToEnd() | ConvertFrom-Json)
-        $Global:responseContent = ($response | ConvertFrom-Json)
-        Write-Log "Response Content: $($responseContent.error.message)" -Level DEBUG
-        #Write-VerboseErrorInformation
-        return [PSCustomObject]@{
-            ErrorCode    = $responseContent.error.code
-            ErrorMessage   = $responseContent.error.message
-            #StatusCode = $response.StatusCode
-            StatusCode = $response.Exception.Response.StatusCode
-            Successful = $false
+        if($response.Exception.Response.StatusCode -eq 308 -or $response.Exception.Response.StatusCode -eq "PermanentRedirect"){
+            switch($PSVersionTable.PSVersion.Major){
+                5 {
+                    return [PSCustomObject]@{
+                        ErrorCode    = $response.Exception.Response.StatuDescription
+                        ErrorMessage  = $response.Exception.Response.Headers["Location"]
+                        StatusCode = $response.Exception.Response.StatusCode
+                        Successful = $false
+                    }
+                }
+                7 {
+                    return [PSCustomObject]@{
+                        ErrorCode    = $response.Exception.Response.StatusCode
+                        ErrorMessage  = $response.Exception.Response.Headers.Location.AbsoluteUri
+                        StatusCode = $response.Exception.Response.StatusCode.value__
+                        Successful = $false
+                    }
+                }
+            }
+        }
+        else{
+            $Script:responseContent = ($response | ConvertFrom-Json)
+            Write-Log "Response Content: $($responseContent.error.message)" -Level DEBUG
+            return [PSCustomObject]@{
+                ErrorCode    = $responseContent.error.code
+                ErrorMessage   = $responseContent.error.message
+                StatusCode = $response.Exception.Response.StatusCode
+                Successful = $false
+            }
         }
     }
 }
@@ -965,14 +987,6 @@ function WriteErrorInformationBase {
     }
 }
 
-function Write-VerboseErrorInformation {
-    [CmdletBinding()]
-    param(
-        [object]$CurrentError = $Error[0]
-    )
-    WriteErrorInformationBase $CurrentError "Write-Verbose"
-}
-
 function Write-HostErrorInformation {
     [CmdletBinding()]
     param(
@@ -986,7 +1000,6 @@ function Get-OAuthToken {
         [array]$AppScope
     )
     if($PermissionType -eq "Application") {
-        #$Script:GraphScope = "$($cloudService.graphApiEndpoint)/.default"
         $Script:GraphScope = "$($Script:GraphScope).default"
         if ([System.String]::IsNullOrEmpty($OAuthCertificate)) {
             $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($OAuthClientSecret)
@@ -1024,7 +1037,7 @@ function Get-OAuthToken {
         #Create OAUTH token
         $oAuthReturnObject = Get-ApplicationAccessToken @createOAuthTokenParams
         if ($oAuthReturnObject.Successful -eq $false) {
-            #Write-Host ""
+            Write-Host ""
             Write-Log "Unable to fetch an OAuth token. Please review the error message below and re-run the script:" -Level ERROR
             Write-Log $oAuthReturnObject.ExceptionMessage -Level ERROR
             exit
@@ -1042,7 +1055,6 @@ function Get-OAuthToken {
         if(-not(($AppScope.Contains("offline_access")))) {
             $AppScope += "offline_access"
         }
-        #$Script:GraphScope = "$($cloudService.GraphApiEndpoint)//$($Scope)"
         $Script:GraphScope = "$($Script:GraphScope)$($AppScope)"
         $oAuthReturnObject = Get-DelegatedAccessToken -AzureADEndpoint $cloudService.AzureADEndpoint -GraphApiUrl $cloudService.GraphApiEndpoint -Scope $Script:GraphScope -ClientID $OAuthClientId -RedirectUri $OAuthRedirectUri
         if ($oAuthReturnObject.Successful -eq $false) {
@@ -1062,14 +1074,14 @@ function SearchMailbox {
         [string]$uriQuery
     )
     Write-Log "Performing search against the mailbox..." -Level INFO
+    #Array to hold the search results for all folders
     $Script:SearchResults = New-Object System.Collections.ArrayList
-    #perform the search against each folder
-    foreach($MailboxFolder in $Global:searchFolders) {
-        $Global:folderSearchResults = New-Object System.Collections.ArrayList
-        $Script:currentFolderName = $MailboxFolder.displayName
+    #Perform the search against each folder
+    foreach($MailboxFolder in $Script:searchFolders) {
+        #Array to hold the search results for the current folder to be used for deletion if the delete switch is set
+        $Script:folderSearchResults = New-Object System.Collections.ArrayList
         Write-Log "Searching folder: $($MailboxFolder.displayName)" -Level INFO
         Write-Log "Processing folder: $($MailboxFolder.id)" -level DEBUG
-        $itemsInFolder = 0
         if($Archive){
             #Check to see if the folder is in the main archive or an aux archive
             $Uri = "admin/exchange/mailboxes/$($Script:userMailbox)/folders/$($MailboxFolder.id)"
@@ -1080,13 +1092,14 @@ function SearchMailbox {
                 Query           = $Uri
             }
             Write-Log "Checking the archive location for folder: $($MailboxFolder.displayName)" -Level DEBUG
-            $Global:FolderCheck = Invoke-GraphApiRequest @FolderCheckParams
-            if($FolderCheck.StatusCode -eq 308){
+            $Script:FolderCheck = Invoke-GraphApiRequest @FolderCheckParams
+            #Check the response to see if the folder is in an aux archive mailbox
+            if($Script:FolderCheck.StatusCode -eq 308){
+                Write-Log $Script:FolderCheck.Response.ErrorMessage -Level DEBUG
                 #Modify the URL using the aux archive guid and the folder id for the folder within the aux archive mailbox
                 $mailboxGuid = $FolderCheck.Response.ErrorMessage -match 'MBX:([a-f0-9\-]+)@' | ForEach-Object { $matches[1] }
                 $folderValue = $FolderCheck.Response.ErrorMessage -match "folders\('([^']+)'\)" | ForEach-Object { $matches[1] }
-                #$uriQuery = "/users/MBX:$($mailboxGuid)@9101fc97-5be5-4438-a1d7-83e051e52057/mailFolders/$($folderValue)"
-                Write-Log "Checking auxiliary archive mailbox $($mailboxGuid) for items in $($MailboxFolder.displayName)" -Level DEBUG
+                Write-Log "Checking auxiliary archive mailbox $($mailboxGuid) for items in $($MailboxFolder.displayName)" -Level INFO
                 $auxUriQuery = "/users/MBX:$($mailboxGuid)@$($OAuthTenantId)/mailFolders/$($folderValue)"
                 $Uri = "$($auxUriQuery)/messages?"
                 $mailboxName = $mailboxGuid
@@ -1101,95 +1114,103 @@ function SearchMailbox {
             $Uri = "$($uriQuery)/$($MailboxFolder.id)/messages?"
         }
         
-        if(-not($UriFilter)) {
-            $UriFilter = CreateSearchQuery
-        }
+        #if(-not($UriFilter)) {
+        #Build the search query based on the parameters provided to the script
+        $UriFilter = CreateSearchQuery
+        #}
 
-        # Finalize the Uri with the final filter/search settings
-        Write-Log ([string]::Format("Performing query using: {0}", $Uri)) -Level DEBUG
-        
         # Search the mailbox for items
         $SearchParams = @{
             GraphApiUrl     = $cloudService.graphApiEndpoint
-            Query           =  "$($Uri)?$UriFilter"
+            Query           =  "$($Uri)$UriFilter"
             AccessToken     = $Script:Token
-            Endpoint        = "beta"
         }
-            
+
         $SearchItems = Invoke-GraphApiRequest @SearchParams
+        #Check for errors in the search request and log them if found, then continue to the next folder
         if($SearchItems.Successful -eq $false){
-            Write-Log "Search failed for folder $($MailboxFolder.displayName). Error: $($SearchItems.ErrorMessage)" -Level WARN
+            Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
+            Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
             continue
         }
         foreach($Result in $SearchItems.Content.Value){
-            $Global:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-            #$itemsInFolder++
+            $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
         }
-        #if($global:folderSearchResults.count -gt 0){
-        #    #exit
-        #}
         while($null -ne $SearchItems.Content.'@odata.nextLink'){
             $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
             $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
             foreach($Result in $SearchItems.Content.Value){
-                $Global:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-                #$itemsInFolder++
+                $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
             }
         }
-        Write-Log ([string]::Format("Found {0} items in the {1} folder.", $Global:folderSearchResults.Count, $MailboxFolder.displayName)) -Level INFO
+        Write-Log ([string]::Format("Found {0} items in the {1} folder.", $Script:folderSearchResults.Count, $MailboxFolder.displayName)) -Level INFO
         #Add the folder results to the total list of results
-        $Script:SearchResults.AddRange($Global:folderSearchResults)
+        $Script:SearchResults.AddRange($Script:folderSearchResults)
 
         #Delete items now to ensure correct mailbox using batches
-        if($DeleteContent -and $global:folderSearchResults.count -gt 0){
-            Write-Log "Deleting $($Global:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
-            [int]$itemsDeleted = 0
-            # Make sure the results are not less than the batch size
-            if($Global:folderSearchResults.count -lt $BatchSize){
-                $BatchSize = $Global:folderSearchResults.Count
+        if($DeleteContent -and $Script:folderSearchResults.count -gt 0){
+            #Confirm with the user that they want to continue with the delete since all folders will be searched
+            if($ConfirmDelete){ 
+                $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
+                $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
+                $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
+                $confirmation = $host.ui.PromptForChoice("Confirmation to delete all items found", "Do you want to continue?", $options, 1)
             }
-            $Query = "`$batch"
-            # Loop thru the results creating batches to delete
-            while($itemsDeleted -lt $Global:folderSearchResults.Count){
-                # Make sure the batch size is not greater than the items left to process
-                if(($Global:folderSearchResults.Count - $itemsDeleted) -lt $BatchSize){
-                    $BatchSize = $Global:folderSearchResults.Count - $itemsDeleted
+            if($confirmation -eq 0 -or $ConfirmDelete -eq $false){
+                #User has confirmed to continue with the delete, so proceed with the delete operation and don't prompt again
+                $ConfirmDelete = $false
+                Write-Log "Deleting $($Script:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
+                [int]$itemsDeleted = 0
+                # Make sure the results are not less than the batch size
+                if($Script:folderSearchResults.count -lt $BatchSize){
+                    $BatchSize = $Script:folderSearchResults.Count
                 }
-                #region CreateBatch
-                $requests = New-Object System.Collections.ArrayList
-                for($x=0; $x -lt $BatchSize; $x++){
-                    if($HardDelete){
-                        $Method = "POST"
-                        $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Global:folderSearchResults[$itemsDeleted].id)/permanentDelete"
+                $Query = "`$batch"
+                # Loop thru the results creating batches to delete
+                while($itemsDeleted -lt $Script:folderSearchResults.Count){
+                    # Make sure the batch size is not greater than the items left to process
+                    if(($Script:folderSearchResults.Count - $itemsDeleted) -lt $BatchSize){
+                        $BatchSize = $Script:folderSearchResults.Count - $itemsDeleted
                     }
-                    else {
-                        $Method = "DELETE"
-                        $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Global:folderSearchResults[$itemsDeleted].id)"
+                    #Create an array of requests to send to the batch endpoint
+                    $requests = New-Object System.Collections.ArrayList
+                    for($x=0; $x -lt $BatchSize; $x++){
+                        if($HardDelete){
+                            $Method = "POST"
+                            $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsDeleted].id)/permanentDelete"
+                        }
+                        else {
+                            $Method = "DELETE"
+                            $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsDeleted].id)"
+                        }
+                        $request = @{
+                            Id          = $x+1
+                            Method      = $Method
+                            Url         = $Url
+                        }
+                        $requests.Add($request) | Out-Null
+                        $itemsDeleted++
                     }
-                    $request = @{
-                        Id          = $x+1
-                        Method      = $Method
-                        Url         = $Url
-                    }
-                    $requests.Add($request) | Out-Null
-                    $itemsDeleted++
+                    $batchRequest = @{
+                        Requests = $requests
+                    } | ConvertTo-Json -Depth 6
+
+                    Write-Log "Sending batch delete request ($BatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
+                    Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest | Out-Null
                 }
-                $batchRequest = @{
-                    Requests = $requests
-                } | ConvertTo-Json -Depth 6
-                #endregion
-                Write-Log "Sending batch delete request ($BatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
-                Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest | Out-Null
+                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsDeleted items processed." -Level INFO
             }
-            Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsDeleted items processed." -Level INFO
         }
-    }      
+    }   
 }    
 function CreateSearchQuery {
+    #Use filter if the message body is not specified, otherwise use search
         if([string]::IsNullOrEmpty($MessageBody)) {
+            #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
-                $UriFilter = "filter=contains(subject,`'$Subject`')&`$top=500"
+                $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
             }
+            #Check if the created before and after dates are specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($CreatedBefore))) {
                 $TempStartDate = [datetime]$CreatedBefore
                 $TempStartDate = $TempStartDate.ToUniversalTime()
@@ -1198,9 +1219,10 @@ function CreateSearchQuery {
                     $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime le $($SearchStartDate) and ")
                 }
                 else {
-                    $UriFilter = "filter=receivedDateTime le $($SearchStartDate)&`$top=500"
+                    $UriFilter = "`$filter=receivedDateTime le $($SearchStartDate)&`$top=500"
                 }
             }
+            #Check if the created after date is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($CreatedAfter))){
                 $TempEndDate = [datetime]$CreatedAfter
                 $TempEndDate = $TempEndDate.ToUniversalTime()
@@ -1209,39 +1231,43 @@ function CreateSearchQuery {
                     $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime ge $($SearchEndDate) and ")
                 }
                 else {
-                    $UriFilter = "filter=receivedDateTime ge $($SearchEndDate)&`$top=500"
+                    $UriFilter = "`$filter=receivedDateTime ge $($SearchEndDate)&`$top=500"
                 }
             }
+            #Check if the sender is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Sender))){
                 if($UriFilter -like '*filter*'){
                     $UriFilter = $UriFilter.Replace('filter=', "filter=(from/emailAddress/address) eq `'$Sender`' and ")
                 }
                 else {
-                    $UriFilter = "filter=(from/emailAddress/address) eq `'$Sender`'&`$top=500"
+                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'&`$top=500"
                 }
             }
         }
         else {
             # Build the search query based on specified parameters
             Write-Log "Creating a query using the search function." -Level DEBUG
-            $UriFilter = "`$search=`"body:$MessageBody`"&`$top=25"
-
+            #Add message body to the search query
+            $UriFilter = "`$search=`"body:$MessageBody`"&`$top=250"
+            #Check if the sender is specified and build the search query accordingly
             if(-not([string]::IsNullOrEmpty($Sender))){
                 if($UriFilter -like '*search*'){
                     $UriFilter = $UriFilter.Replace('search="', "search=`"from:$Sender` AND ")
                 }
                 else{
-                    $UriFilter = "`$search=`"from:$Sender`"&`$top=25"
+                    $UriFilter = "`$search=`"from:$Sender`"&`$top=250"
                 }
             }
+            #Check if the subject is specified and build the search query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))){
                 if($UriFilter -like '*search*'){
                     $UriFilter = $UriFilter.Replace('search="', "search=`"subject:$Subject` AND ")
                 }
                 else{
-                    $UriFilter = "`$search=`"subject:$Subject`"&`$top=1000&`$select=id,parentfolderid,receivedDateTime,subject,from"#&`$from=$PageNumber"
+                    $UriFilter = "`$search=`"subject:$Subject`"&`$top=250&`$select=id,parentfolderid,receivedDateTime,subject,from"#&`$from=$PageNumber"
                 }
             }
+            #Check if the created before and after dates are specified and build the search query accordingly
             if(-not([string]::IsNullOrEmpty($CreatedBefore))){
                 $TempStartDate = [datetime]$CreatedBefore
                 $TempStartDate = $TempStartDate.ToUniversalTime()
@@ -1253,6 +1279,7 @@ function CreateSearchQuery {
                     $UriFilter = "`$search=`"received<=$SearchBeforeDate`"&`$top=25"
                 }
             }
+            #Check if the created after date is specified and build the search query accordingly
             if(-not([string]::IsNullOrEmpty($CreatedAfter))){
                 $TempStartDate = [datetime]$CreatedAfter
                 $TempStartDate = $TempStartDate.ToUniversalTime()
@@ -1270,49 +1297,47 @@ function CreateSearchQuery {
     
 function GetFolderList{
     Write-Log "Getting a list of folders in the mailbox..." -Level INFO
-    $Global:folderList = New-Object System.Collections.ArrayList
+    #Create an arraylist to hold the folder results
+    $Script:folderList = New-Object System.Collections.ArrayList
     [string]$Query = "users/$($Script:userMailbox)/mailFolders/delta"
     $params = @{
         AccessToken         = $Script:Token
         GraphApiUrl         = $cloudService.graphApiEndpoint
         Query               = $Query
     }
-
-    $Global:FolderResults = Invoke-GraphApiRequest @params
-    if($FolderResults.Successful -eq $false){
+    $Script:FolderResults = Invoke-GraphApiRequest @params
+    #Check for errors in the folder enumeration request and log them if found, then exit the script
+    if($Script:FolderResults.Successful -eq $false){
         Write-Log "Unable to get a list of folders in the mailbox. Please review the error message below and re-run the script:" -Level ERROR
-        Write-Log $FolderResults.ErrorMessage -Level ERROR
+        Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
         exit
     }
-    foreach($Result in $FolderResults.Content.Value){
-        $Global:folderList.Add($Result) | Out-Null
-    }
-        
-    while($null -ne $FolderResults.Content.'@odata.nextLink'){
-        $Query = $FolderResults.Content.'@odata.nextLink'.Substring($FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
-        $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
-        foreach($Result in $FolderResults.Content.Value){
-            $Global:folderList.Add($Result) | Out-Null
+    foreach($Result in $Script:FolderResults.Content.Value){
+        $Script:folderList.Add($Result) | Out-Null
+    }   
+    while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
+        $Query = $Script:FolderResults.Content.'@odata.nextLink'.Substring($Script:FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+        foreach($Result in $Script:FolderResults.Content.Value){
+            $Script:folderList.Add($Result) | Out-Null
         }
     }
-    Write-Log "Folder enumeration complete. $($Global:folderList.Count) folders found." -Level INFO
+    Write-Log "Folder enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
     BuildFolderListTree
 }
 function BuildFolderListTree{
-    Write-Log "Building folder tree..." -Level INFO
+    Write-Log "Getting list of subfolders..." -Level DEBUG
+    #Create an arraylist to hold the folder tree results
     $Script:folderListTree = New-Object System.Collections.ArrayList
     $foundFolders = 0
-    
-    #first folders under MsgFolderRoot
-    $Global:folderList | Where-Object {
-        ($_.parentFolderId -notin ($Global:folderList | ForEach-Object { $_.id }))
-    } | ForEach-Object { 
+    #Start with the root folder and add it to the tree
+    $Script:folderList | Where-Object { ($_.parentFolderId -notin ($Script:folderList | ForEach-Object { $_.id })) } | ForEach-Object { 
         $_.displayName = "\$($_.displayName)"
         $Script:folderListTree.Add($_) | Out-Null
         $foundFolders++
     }
-    #loop through the folder list to find all folders under the root
-    foreach($folder in $Global:folderlist){
+    #Loop through the folder list to find all folders under the root
+    foreach($folder in $Script:folderList){
         if($folder.parentFolderId -eq $rootFolderId.id){
             $folder.displayName = "\$($folder.displayName)"
             $Script:folderListTree.Add($folder) | Out-Null
@@ -1320,24 +1345,26 @@ function BuildFolderListTree{
         }
     }
 
-    #loop through until all folders are found
-    while($foundFolders -lt $Global:folderList.Count){
-        foreach($folder in $Global:folderlist){
-            foreach($treeFolder in $folderListTree){
+    #Loop through until all folders are found
+    while($foundFolders -lt $Script:folderList.Count){
+        foreach($folder in $Script:folderList){
+            foreach($treeFolder in $Script:folderListTree){
                 if($folder.parentFolderId -eq $treeFolder.id){
                     $folder.displayName = "$($treeFolder.displayName)\$($folder.displayName)"
-                    $folderListTree.Add($folder) | Out-Null
+                    $Script:folderListTree.Add($folder) | Out-Null
                     $foundFolders++
                     break
                 }
             }
         }
     }
+    $Script:folderListTree = $Script:folderListTree | Sort-Object displayName
 }
 
 function GetRecoverableItemsFolderList{
     Write-Log "Getting a list of folders in the recoverable items..." -Level INFO
-    $Global:folderList = New-Object System.Collections.ArrayList
+    #Create an arraylist to hold the folder results
+    $Script:folderList = New-Object System.Collections.ArrayList
     [string]$Query = "users/$($Script:userMailbox)/mailFolders/RecoverableItemsRoot/childfolders/?includeHiddenFolders=true"
 
     $params = @{
@@ -1345,26 +1372,27 @@ function GetRecoverableItemsFolderList{
         GraphApiUrl         = $cloudService.graphApiEndpoint
         Query               = $Query
     }
-    $Global:FolderResults = Invoke-GraphApiRequest @params
-    if($FolderResults.Successful -eq $false){
+    $Script:FolderResults = Invoke-GraphApiRequest @params
+    #Check for errors in the folder enumeration request and log them if found, then exit the script
+    if($Script:FolderResults.Successful -eq $false){
         Write-Log "Unable to get a list of folders in the recoverable items. Please review the error message below and re-run the script:" -Level ERROR
-        Write-Log $FolderResults.ErrorMessage -Level ERROR
+        Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
         exit
     }
-    foreach($Result in $FolderResults.Content.Value){
-        $Global:folderList.Add($Result) | Out-Null
+    foreach($Result in $Script:FolderResults.Content.Value){
+        $Script:folderList.Add($Result) | Out-Null
     }    
-    while($null -ne $FolderResults.Content.'@odata.nextLink'){
-        $Query = $FolderResults.Content.'@odata.nextLink'.Substring($FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
-        $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
-        foreach($Result in $FolderResults.Content.Value){
-            $Global:folderList.Add($Result) | Out-Null
+    while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
+        $Query = $Script:FolderResults.Content.'@odata.nextLink'.Substring($Script:FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+        foreach($Result in $Script:FolderResults.Content.Value){
+            $Script:folderList.Add($Result) | Out-Null
         }
     }
 
-    #get subfolders
+    #Get subfolders for each folder in the recoverable items
     $subfolderList = New-Object System.Collections.ArrayList
-    foreach($folder in $Global:folderList){
+    foreach($folder in $Script:folderList){
         $Query = "users/$($Script:userMailbox)/mailFolders/$($folder.id)/childfolders/?includeHiddenFolders=true"
         $params = @{
             AccessToken         = $Script:Token
@@ -1385,10 +1413,10 @@ function GetRecoverableItemsFolderList{
         }
     }
     foreach($subfolder in $subfolderList){
-        $Global:folderList.Add($subfolder) | Out-Null
+        $Script:folderList.Add($subfolder) | Out-Null
     }
     BuildFolderListTree
-    Write-Log "Recoverable items enumeration complete. $($Global:folderList.Count) folders found." -Level INFO
+    Write-Log "Recoverable items enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
 }
 
 #Get parameters and pass to obtain an OAuth token
@@ -1401,27 +1429,25 @@ $Script:applicationInfo = @{
 $Script:GraphScope = "$($cloudService.GraphApiEndpoint)/"
 Get-OAuthToken -AppScope $Scope
 
-[string]$Endpoint = "beta"
-
-#Check if archive mailbox and obtain mailbox connection settings
-
-    
+#Get the mailbox settings to retrieve the primary and archive mailbox guids for the specified mailbox
 [string]$Query = "users/$Mailbox/settings/exchange"
 $params = @{
     AccessToken         = $Script:Token
     GraphApiUrl         = $cloudService.graphApiEndpoint
     Query               = $Query
-    Endpoint            = $Endpoint
+    #Endpoint            = $Endpoint
 }
-$Global:MailboxSettings = Invoke-GraphApiRequest @params
+$Script:MailboxSettings = Invoke-GraphApiRequest @params
+#Check for errors in the mailbox settings request and log them if found, then exit the script
 if($MailboxSettings.Successful -eq $false){
     Write-Log "Unable to retrieve mailbox settings for $Mailbox. Please check the mailbox name and try again." -Level ERROR
     Write-Log "Error details: $($MailboxSettings.ErrorMessage)" -Level ERROR
     exit
 }
+#Capture the primary and archive mailbox guids for use in the search
 $Script:archiveMailbox = $MailboxSettings.Content.inPlaceArchiveMailboxId
 $Script:primaryMailbox = $MailboxSettings.content.primaryMailboxId
-
+#Determine which mailbox to use based on the Archive switch parameter
 if($Archive){
     $Script:userMailbox = $script:archiveMailbox
     Write-Log "Using archive mailbox: $($Script:userMailbox)" -Level INFO
@@ -1439,32 +1465,47 @@ else{
     GetRecoverableItemsFolderList
 }
 
-#region BuildSearchFolderList
 #Determine the folder to search based on include/exclude lists
 Write-Log "Determining folders to search..." -Level INFO
-$Global:searchFolders = New-Object System.Collections.ArrayList
-
+#Create an arraylist to hold the folders to be searched
+$Script:searchFolders = New-Object System.Collections.ArrayList
+#Check is specific folders are specified in the include list, if not, search all folders under the root
 if([string]::IsNullOrEmpty($IncludeFolderList)){
     #If no include list is specified, search all folders under the desired root
-    $Global:searchFolders = $Script:folderListTree
+    $Script:searchFolders = $Script:folderListTree
+    if(-not($ExcludeFolderList)){
+        Write-Log "No include list specified. Searching all folders ($($Script:searchFolders.Count) folders)..." -Level WARN
+        $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
+        $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
+        $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
+        $confirmation = $host.ui.PromptForChoice("Confirmation", "Do you want to continue?", $options, 1)
+        #Confirm with the user that they want to continue with the search since all folders will be searched
+        if($confirmation -ne 0){
+            Write-Log "Search cancelled by user." -Level WARN
+            exit
+        }
+    }
 }
 else {
     Write-Log "Building folder search list from include list..." -Level INFO
     #Add folders that match the include list
     if($ProcessSubfolders){
         foreach($folder in $IncludeFolderList){
-            $Global:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName.split('\')[-1] -eq $folder })) | Out-Null
+            #Add all subfolders of the specified folder to the search list
+            $Script:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName.split('\')[-1] -eq $folder })) | Out-Null
             $subfolders = ($Script:folderListTree | Where-Object { $_ -match "\\$($folder)($|\\)" })
             foreach($subfolder in $subfolders){
-                $Global:searchFolders.Add($subfolder) | out-null
+                $Script:searchFolders.Add($subfolder) | out-null
             }
         }
     }
     else {
+        #Add only the specified folders to the search list
         foreach($folder in $IncludeFolderList){
-            $Global:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName.split('\')[-1] -eq $folder })) | Out-Null
+            $Script:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName.split('\')[-1] -eq $folder })) | Out-Null
             if($Archive){
                 $subfolders = ($Script:folderListTree | Where-Object { $_ -match "\\$($folder)($|\\)" })
+                #Include any subfolders that were created by the aux archive mailbox
                 $auxSubfolders = $subfolders | Where-Object {
                     $parts = $_ -split '\\'
                     $rootFolder = $parts[-2]
@@ -1473,7 +1514,7 @@ else {
                     $lastPart -match "^$([regex]::Escape($rootFolder))_\d{4}\s+\(Created on"
                 }
                 foreach($subfolder in $auxSubfolders){
-                    $Global:searchFolders.Add($subfolder) | out-null
+                    $Script:searchFolders.Add($subfolder) | Out-Null
                 }
 
             }
@@ -1485,29 +1526,42 @@ else {
 $removeFolderList = New-Object System.Collections.ArrayList
 if($ExcludeFolderList){
     Write-Log "Removing excluded folders from the list..." -Level INFO
+    #Find all folders that match the exclude list and add them to the remove list
     foreach ($exclude in $ExcludeFolderList) {
-        $removeFolderList.Add(($Global:searchFolders | Where-Object { $_.displayName.split('\')[-1] -eq $exclude})) | out-Null
+        $removeFolderList.Add(($Script:searchFolders | Where-Object { $_.displayName.split('\')[-1] -eq $exclude})) | Out-Null
     }
+    #Remove the excluded folders and all subfolders from the search list
     if($removeFolderList.Count -gt 0){
-        foreach($r in $removeFolderList){
-            $Global:searchFolders.Remove($r) | Out-Null
+        $newSearchFolders = New-Object System.Collections.ArrayList
+        foreach($folder in $Script:searchFolders){
+            $shouldExclude = $false
+            foreach($exclude in $ExcludeFolderList){
+                if($folder.displayName -match "\\$([regex]::Escape($exclude))($|\\)"){
+                    $shouldExclude = $true
+                    break
+                }
+            }
+            if(-not $shouldExclude){
+                $newSearchFolders.Add($folder) | Out-Null
+            }
         }
+        $Script:searchFolders = $newSearchFolders
+        $newSearchFolders = $null
     }
 }
 
-Write-Log "Final list of folders to be searched ($($Global:searchFolders.Count) folders):" -Level INFO
-$Global:searchFolders | ForEach-Object { Write-Log "  $($_.displayName)" -Level DEBUG }
-$Global:searchFolders | Format-Table displayName
-#endregion
+Write-Log "Final list of folders to be searched ($($Script:searchFolders.Count) folders):" -Level INFO
+$Script:searchFolders | ForEach-Object { Write-Log "  $($_.displayName)" -Level DEBUG }
+$Script:searchFolders | Format-Table displayName
 
-#Initiate the search
-#$Global:testFolderAccess = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query "/admin/exchange/mailboxes/$Script:userMailbox/mailFolders" -AccessToken $Script:Token -Method GET -Endpoint beta
-
+#Create csv file to hold the search results
 $Script:searchResultsCsvPath = "$($OutputPath)\SearchResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 Write-Log "Search results will be saved to: $($Script:searchResultsCsvPath)" -Level INFO
+#Initiate the search against the mailbox using the specified query and parameters
 SearchMailbox -uriQuery "/users/$Script:userMailbox/mailFolders"
 
 Write-Log ([string]::Format("Search complete. {0} item(s) found in total.", $Script:SearchResults.Count)) -Level INFO
+#Export the search results to a CSV file
 $Script:SearchResults | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append
 Write-Log "Results exported to: $($Script:searchResultsCsvPath)" -Level INFO
 Write-Log "Script completed. Log file: $($Script:LogFile)" -Level INFO
