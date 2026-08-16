@@ -87,6 +87,8 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="The MessageBody parameter specifies the body string used by the search.")] 
     [string]$MessageBody=$null,
 
+    [string]$AttachmentName,
+
     [Parameter(Mandatory=$False,HelpMessage="The DeleteContent parameter is a switch to delete the content found by the search. If not specified, the script will only report the number of items that would be deleted.")]
     [switch]$DeleteContent,
     
@@ -896,7 +898,6 @@ function Invoke-WebRequestWithProxyDetection {
     catch {
         $response = $_
         Write-Log $response -Level DEBUG
-
         if($response.Exception.Response.StatusCode -eq 308 -or $response.Exception.Response.StatusCode -eq "PermanentRedirect"){
             switch($PSVersionTable.PSVersion.Major){
                 5 {
@@ -918,12 +919,18 @@ function Invoke-WebRequestWithProxyDetection {
             }
         }
         else{
-            $Script:responseContent = ($response | ConvertFrom-Json)
-            Write-Log "Response Content: $($responseContent.error.message)" -Level DEBUG
+            $reader = [System.IO.StreamReader]::New($response.Exception.Response.GetResponseStream())
+            try {
+                $body = $reader.ReadToEnd()
+                $responseContent = $body | ConvertFrom-Json
+            }
+            finally {
+                $reader.Dispose()
+            }
             return [PSCustomObject]@{
                 ErrorCode    = $responseContent.error.code
                 ErrorMessage   = $responseContent.error.message
-                StatusCode = $response.Exception.Response.StatusCode
+                StatusCode = [int]$response.Exception.Response.StatusCode
                 Successful = $false
             }
         }
@@ -1114,10 +1121,11 @@ function SearchMailbox {
             $Uri = "$($uriQuery)/$($MailboxFolder.id)/messages?"
         }
         
-        #if(-not($UriFilter)) {
-        #Build the search query based on the parameters provided to the script
-        $UriFilter = CreateSearchQuery
-        #}
+        #Use the same search query for all folders, so only build it once if it hasn't been built yet
+        if(-not($UriFilter)) {
+            #Build the search query based on the parameters provided to the script
+            $UriFilter = CreateSearchQuery
+        }
 
         # Search the mailbox for items
         $SearchParams = @{
@@ -1131,10 +1139,13 @@ function SearchMailbox {
         if($SearchItems.Successful -eq $false){
             Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
             Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
+            exit
             continue
         }
         foreach($Result in $SearchItems.Content.Value){
+            $Global:MailboxSearchResults = $Result
             $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+
         }
         while($null -ne $SearchItems.Content.'@odata.nextLink'){
             $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
@@ -1205,7 +1216,7 @@ function SearchMailbox {
 }    
 function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
-        if([string]::IsNullOrEmpty($MessageBody)) {
+        if([string]::IsNullOrEmpty($MessageBody) -and [string]::IsNullOrEmpty($AttachmentName)) {
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
                 $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
@@ -1243,12 +1254,23 @@ function CreateSearchQuery {
                     $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'&`$top=500"
                 }
             }
+            if(-not([string]::IsNullOrEmpty($AttachmentName))){
+                if($UriFilter -like '*filter*'){
+                    $UriFilter = $UriFilter.Replace('filter=', "filter=hasAttachments eq true and ")
+                    $UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
+                }
+                else {
+                    $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=500"
+                }
+            }
         }
         else {
             # Build the search query based on specified parameters
             Write-Log "Creating a query using the search function." -Level DEBUG
             #Add message body to the search query
-            $UriFilter = "`$search=`"body:$MessageBody`"&`$top=250"
+            if(-not([string]::IsNullOrEmpty($MessageBody))){
+                $UriFilter = "`$search=`"body:$MessageBody`"&`$top=250"
+            }
             #Check if the sender is specified and build the search query accordingly
             if(-not([string]::IsNullOrEmpty($Sender))){
                 if($UriFilter -like '*search*'){
@@ -1291,6 +1313,7 @@ function CreateSearchQuery {
                     $UriFilter = "`$search=`"received>=$SearchAfterDate`"&`$top=25"
                 }
             }
+            
         }
         return $UriFilter    
 }
