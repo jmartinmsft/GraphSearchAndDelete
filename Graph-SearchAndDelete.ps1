@@ -1143,12 +1143,12 @@ function SearchMailbox {
             continue
         }
         foreach($Result in $SearchItems.Content.Value){
-            $Global:MailboxSearchResults = $Result
             if([string]::IsNullOrEmpty($AttachmentName)){
                 $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
             }
             else{
                 foreach($attachment in $Result.Attachments){
+                    Write-Log "checking attachment $($attachment.name) against $($AttachmentName)" -Level info
                     if($attachment.name -eq $AttachmentName){
                         $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
                     }
@@ -1330,7 +1330,15 @@ function CreateSearchQuery {
                     $UriFilter = "`$search=`"received>=$SearchAfterDate`"&`$top=25"
                 }
             }
-            
+            if(-not([string]::IsNullOrEmpty($AttachmentName))){
+                if($UriFilter -like '*search*'){
+                    $UriFilter = $UriFilter.Replace('search="', "search=`"attachment:$($AttachmentName) AND ")
+                    $UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
+                }
+                else{
+                    $UriFilter = "`$search=`"attachment:$($AttachmentName)&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=25"
+                }
+            }
         }
         return $UriFilter    
 }
