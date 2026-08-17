@@ -1233,7 +1233,7 @@ function SearchMailbox {
 }    
 function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
-        if([string]::IsNullOrEmpty($MessageBody)) {
+        if([string]::IsNullOrEmpty($MessageBody) -and [string]::IsNullOrEmpty($AttachmentName)) {
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
                 $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
