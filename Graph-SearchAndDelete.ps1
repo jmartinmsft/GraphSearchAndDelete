@@ -1091,9 +1091,6 @@ function Check-FilterResults{
                 break
             }
         }
-        #if(-not($attachmentFound)){
-        #    return
-        #}
     }
     
     #Check if message body is specified
@@ -1179,13 +1176,23 @@ function SearchMailbox {
             continue
         }
         foreach($Result in $SearchItems.Content.Value){
-            Check-FilterResults -Result $Result
+            if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
+                Check-FilterResults -Result $Result
+            }
+            else{
+                $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+            }
         }
         while($null -ne $SearchItems.Content.'@odata.nextLink'){
             $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
             $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
             foreach($Result in $SearchItems.Content.Value){
-                Check-FilterResults -Result $Result
+                if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
+                   Check-FilterResults -Result $Result
+                }
+                else{
+                    $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+                }
             }
         }
         Write-Log ([string]::Format("Found {0} items in the {1} folder.", $Script:folderSearchResults.Count, $MailboxFolder.displayName)) -Level INFO
