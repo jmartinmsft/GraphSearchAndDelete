@@ -14,12 +14,12 @@ Message body searches are limited to 275 results per folder. Multiple runs are n
 ## Usage
 Search the Inbox for items from a sender and only generate a CSV file with the results:
 ```powershell
-$secret = ConvertTo-SecureString -String "xxxxxxxxxxxxxxxxxxxxxxxxxx" -AsPlainText -Force
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -SenderAddress kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
+$secret = ConvertTo-SecureString -String "AppRegSecretInEntra" -AsPlainText -Force
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\Output -SenderAddress kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 ```
 Search the entire mailbox for items containing a subject and message body and delete those items in batches of 10 items:
 ```powershell
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -Subject Microsoft -MessageBody Exchange -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret -BatchSize 10
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\Output -Subject Microsoft -MessageBody Exchange -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret -BatchSize 10
 ```
 Search the recoverable items for items within a date range and delete those items:
 ```powershell
@@ -54,6 +54,8 @@ Search the archive mailbx (including aux archive mailboxes) for items containing
 
 **MessageBody** - The MessageBody parameter specifies the body string used by the search.
 
+**AttachmentName** - The AttachmentName parameter specifies the name of the attachment used to filter search results.
+
 **DeleteContent** - The DeleteContent parameter is a switch to delete the items found in the search results (moved to Deleted Items).
 
 **HardDelete** The HardDelete parameter is a switch to hard-delete the items found in the search results
@@ -81,3 +83,5 @@ Search the archive mailbx (including aux archive mailboxes) for items containing
 **LogFile** - The LogFile parameter specifies the full path for the script log file. If not specified, a log file is created in the OutputPath.
 
 **BatchSize** - The BatchSize parameter specifies how many items to delete within a batch request.
+
+**ConfirmDelete** - The Confirm switch specifies whether to prompt for confirmation before performing delete actions.

@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260815.2136
+# Version 20260816.2023
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -87,6 +87,7 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="The MessageBody parameter specifies the body string used by the search.")] 
     [string]$MessageBody=$null,
 
+    [Parameter(Mandatory=$False,HelpMessage="The AttachmentName parameter specifies the name of the attachment used to filter search results.")]
     [string]$AttachmentName,
 
     [Parameter(Mandatory=$False,HelpMessage="The DeleteContent parameter is a switch to delete the content found by the search. If not specified, the script will only report the number of items that would be deleted.")]
@@ -1149,7 +1150,6 @@ function SearchMailbox {
             else{
                 foreach($attachment in $Result.Attachments){
                     if($attachment.name -eq $AttachmentName){
-                        write-log "Attachment $($AttachmentName) found in message $($Result.subject) in folder $($MailboxFolder.displayName)" -Level INFO
                         $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
                     }
                 }
