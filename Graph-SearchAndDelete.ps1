@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260816.2023
+# Version 20260816.2050
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -1233,55 +1233,6 @@ function SearchMailbox {
 }    
 function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
-        if([string]::IsNullOrEmpty($MessageBody) -and [string]::IsNullOrEmpty($AttachmentName)) {
-            #Check if the subject is specified and build the filter query accordingly
-            if(-not([string]::IsNullOrEmpty($Subject))) {
-                $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
-            }
-            #Check if the created before and after dates are specified and build the filter query accordingly
-            if(-not([string]::IsNullOrEmpty($CreatedBefore))) {
-                $TempStartDate = [datetime]$CreatedBefore
-                $TempStartDate = $TempStartDate.ToUniversalTime()
-                $SearchStartDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempStartDate
-                if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime le $($SearchStartDate) and ")
-                }
-                else {
-                    $UriFilter = "`$filter=receivedDateTime le $($SearchStartDate)&`$top=500"
-                }
-            }
-            #Check if the created after date is specified and build the filter query accordingly
-            if(-not([string]::IsNullOrEmpty($CreatedAfter))){
-                $TempEndDate = [datetime]$CreatedAfter
-                $TempEndDate = $TempEndDate.ToUniversalTime()
-                $SearchEndDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempEndDate
-                if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime ge $($SearchEndDate) and ")
-                }
-                else {
-                    $UriFilter = "`$filter=receivedDateTime ge $($SearchEndDate)&`$top=500"
-                }
-            }
-            #Check if the sender is specified and build the filter query accordingly
-            if(-not([string]::IsNullOrEmpty($Sender))){
-                if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=(from/emailAddress/address) eq `'$Sender`' and ")
-                }
-                else {
-                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'&`$top=500"
-                }
-            }
-            if(-not([string]::IsNullOrEmpty($AttachmentName))){
-                if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=hasAttachments eq true and ")
-                    $UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
-                }
-                else {
-                    $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=500"
-                }
-            }
-        }
-        else {
             # Build the search query based on specified parameters
             Write-Log "Creating a query using the search function." -Level DEBUG
             #Add message body to the search query
@@ -1339,7 +1290,7 @@ function CreateSearchQuery {
                     $UriFilter = "`$search=`"attachment:$($AttachmentName)&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=25"
                 }
             }
-        }
+        
         return $UriFilter    
 }
     
