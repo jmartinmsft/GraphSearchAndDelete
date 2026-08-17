@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260817.1413
+# Version 20260817.1649
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -393,94 +393,86 @@ function Get-ApplicationAccessToken {
     }
 }
 
-function CheckTokenExpiry {
+function Update-AccessTokenIfNeeded {
     param(
-            $ApplicationInfo,
-            [ref]$EWSService,
-            [ref]$Token,
-            [string]$Environment,
-            $EWSOnlineURL,
-            $AuthScope,
-            $AzureADEndpoint
-        )
+        [switch]$Force
+    )
+    if($null -ne $Script:tokenLastRefreshTime) {
+        $refreshAt = $Script:tokenLastRefreshTime.AddMinutes(55)
+    }
 
-    # if token is going to expire in next 5 min then refresh it
-    if ($null -eq $script:tokenLastRefreshTime -or $script:tokenLastRefreshTime.AddMinutes(55) -lt (Get-Date)) {
-        Write-Verbose "Requesting new OAuth token as the current token expires at $($script:tokenLastRefreshTime)."
-        if($PermissionType -eq "Application") {
-        $createOAuthTokenParams = @{
-            TenantID                       = $ApplicationInfo.TenantID
-            ClientID                       = $ApplicationInfo.ClientID
-            Endpoint                       = $AzureADEndpoint
-            CertificateBasedAuthentication = (-not([System.String]::IsNullOrEmpty($ApplicationInfo.CertificateThumbprint)))
-            #Scope                          = $AuthScope
-            Scope                           = $Script:GraphScope
+    if (-not $Force -and $null -ne $Script:tokenLastRefreshTime -and (Get-Date) -lt $refreshAt) {
+        return
+    }
+
+    Write-Log "Refreshing OAuth access token." -Level DEBUG
+
+    if ($PermissionType -eq 'Application') {
+        $tokenParams = @{
+            TenantID = $Script:applicationInfo.TenantID
+            ClientID = $Script:applicationInfo.ClientID
+            Endpoint = $cloudService.AzureADEndpoint
+            Scope    = $Script:GraphScope
+            CertificateBasedAuthentication = -not [string]::IsNullOrEmpty(
+                $Script:applicationInfo.CertificateThumbprint
+            )
         }
 
-        # Check if we use an app secret or certificate by using regex to match Json Web Token (JWT)
-        if ($ApplicationInfo.AppSecret -match "^([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_\-\+\/=]*)") {
-            $jwtParams = @{
-                CertificateThumbprint = $ApplicationInfo.CertificateThumbprint
-                CertificateStore      = $CertificateStore
-                Issuer                = $ApplicationInfo.ClientID
-                Audience              = "$AzureADEndpoint/$($ApplicationInfo.TenantID)/oauth2/v2.0/token"
-                Subject               = $ApplicationInfo.ClientID
-            }
-            $jwt = Get-NewJsonWebToken @jwtParams
+        if ($tokenParams.CertificateBasedAuthentication) {
+            $jwt = Get-NewJsonWebToken `
+                -CertificateThumbprint $Script:applicationInfo.CertificateThumbprint `
+                -CertificateStore $CertificateStore `
+                -Issuer $Script:applicationInfo.ClientID `
+                -Subject $Script:applicationInfo.ClientID `
+                -Audience "$($cloudService.AzureADEndpoint)/$($Script:applicationInfo.TenantID)/oauth2/v2.0/token"
 
-            if ($null -eq $jwt) {
-                Write-Host "Unable to sign a new Json Web Token by using certificate: $($ApplicationInfo.CertificateThumbprint)" -ForegroundColor Red
-                exit
+            if (-not $jwt) {
+                throw "Unable to generate a certificate assertion."
             }
 
-            $createOAuthTokenParams.Add("Secret", $jwt)
-        } else {
-            $createOAuthTokenParams.Add("Secret", $ApplicationInfo.AppSecret)
-        }
-
-        $oAuthReturnObject = Get-ApplicationAccessToken @createOAuthTokenParams
-        if ($oAuthReturnObject.Successful -eq $false) {
-            Write-Host ""
-            Write-Host "Unable to refresh EWS OAuth token. Please review the error message below and re-run the script:" -ForegroundColor Red
-            Write-Host $oAuthReturnObject.ExceptionMessage -ForegroundColor Red
-            exit
-        }
-        Write-Log "Obtained a new OAuth token (Application)" -Level INFO
-        $Script:Token = $oAuthReturnObject.OAuthToken.access_token
-        $script:tokenLastRefreshTime = $oAuthReturnObject.LastTokenRefreshTime
-        #return $oAuthReturnObject.OAuthToken.access_token
+            $tokenParams.Secret = $jwt
         }
         else {
-            #$connectionSuccessful = $false
-    
-            # Request an authorization code from the Microsoft Azure Active Directory endpoint
-            $redeemAuthCodeParams = @{
-                Uri             = "$AzureADEndpoint/organizations/oauth2/v2.0/token"
-                Method          = "POST"
-                ContentType     = "application/x-www-form-urlencoded"
-                Body            = @{
-                    client_id     = $ApplicationInfo.ClientID
-                    scope         = $AuthScope
-                    grant_type    = "refresh_token"
-                    refresh_token =  $Script:RefreshToken
-                }
-                UseBasicParsing = $true
-            }
-            $redeemAuthCodeResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $redeemAuthCodeParams
-
-            if ($redeemAuthCodeResponse.StatusCode -eq 200) {
-                $tokens = $redeemAuthCodeResponse.Content | ConvertFrom-Json
-                $script:tokenLastRefreshTime = (Get-Date)
-                $Script:RefreshToken = $tokens.refresh_token
-                $Script:Token = $tokens.access_token
-            } 
-            else {
-                Write-Host "Unable to redeem the authorization code for an access token." -ForegroundColor Red
-                exit
-            }
+            $tokenParams.Secret = $Script:applicationInfo.AppSecret
         }
+
+        $result = Get-ApplicationAccessToken @tokenParams
+
+        if (-not $result.Successful) {
+            throw "Unable to refresh access token: $($result.ExceptionMessage)"
+        }
+
+        $Script:Token = $result.OAuthToken.access_token
+        $Script:tokenLastRefreshTime = $result.LastTokenRefreshTime
     }
-    #return $Script:Token
+    else {
+        $params = @{
+            Uri         = "$($cloudService.AzureADEndpoint)/organizations/oauth2/v2.0/token"
+            Method      = 'POST'
+            ContentType = 'application/x-www-form-urlencoded'
+            Body        = @{
+                client_id     = $Script:applicationInfo.ClientID
+                scope         = $Script:GraphScope
+                grant_type    = 'refresh_token'
+                refresh_token = $Script:RefreshToken
+            }
+            UseBasicParsing = $true
+        }
+
+        $response = Invoke-WebRequestWithProxyDetection `
+            -ParametersObject $params
+
+        if ($response.StatusCode -ne 200) {
+            throw "Unable to refresh delegated access token."
+        }
+
+        $tokens = $response.Content | ConvertFrom-Json
+        $Script:Token = $tokens.access_token
+        $Script:RefreshToken = $tokens.refresh_token
+        $Script:tokenLastRefreshTime = Get-Date
+    }
+
+    Write-Log "OAuth access token refreshed." -Level INFO
 }
 
 function Get-DelegatedAccessToken {
@@ -815,9 +807,12 @@ function Invoke-GraphApiRequest {
         $content = $null
     }
     process {
+        #Check for expired token before making Graph request
+        Update-AccessTokenIfNeeded
+
         $graphApiRequestParams = @{
             Uri             = "$GraphApiUrl/$Endpoint/$($Query.TrimStart("/"))"
-            Header          = @{ Authorization = "Bearer $AccessToken" }
+            Header          = @{ Authorization = "Bearer $Script:Token" }
             Method          = $Method
             ContentType     = $ContentType
             UseBasicParsing = $true
@@ -836,6 +831,12 @@ function Invoke-GraphApiRequest {
 
         Write-Log "Graph API uri called: $($graphApiRequestParams.Uri)" -Level DEBUG
         $Script:graphApiResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $graphApiRequestParams
+        if($Script:graphApiResponse.StatusCode -eq 401){
+            Write-Log "Graph returned 401; forcing token refresh" -Level WARN
+            Update-AccessTokenIfNeeded -Force
+            $graphApiRequestParams.Header.Authorization = "Bearer $Script:Token"
+            $Script:graphApiResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $graphApiRequestParams
+        }
         if (($null -eq $graphApiResponse) -or
             ([System.String]::IsNullOrEmpty($graphApiResponse.StatusCode))) {
             Write-Log "Graph API request failed - no response" -Level DEBUG
@@ -1220,27 +1221,29 @@ function SearchMailbox {
                 $ConfirmDelete = $false
                 Write-Log "Deleting $($Script:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
                 [int]$itemsDeleted = 0
+                [int]$itemsFailedDelete = 0
+                [int]$itemsProcessed = 0
                 # Make sure the results are not less than the batch size
                 if($Script:folderSearchResults.count -lt $BatchSize){
                     $BatchSize = $Script:folderSearchResults.Count
                 }
                 $Query = "`$batch"
                 # Loop thru the results creating batches to delete
-                while($itemsDeleted -lt $Script:folderSearchResults.Count){
+                while($itemsProcessed -lt $Script:folderSearchResults.Count){
                     # Make sure the batch size is not greater than the items left to process
-                    if(($Script:folderSearchResults.Count - $itemsDeleted) -lt $BatchSize){
-                        $BatchSize = $Script:folderSearchResults.Count - $itemsDeleted
+                    if(($Script:folderSearchResults.Count - $itemsProcessed) -lt $BatchSize){
+                        $BatchSize = $Script:folderSearchResults.Count - $itemsProcessed
                     }
                     #Create an array of requests to send to the batch endpoint
                     $requests = New-Object System.Collections.ArrayList
                     for($x=0; $x -lt $BatchSize; $x++){
                         if($HardDelete){
                             $Method = "POST"
-                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsDeleted].id)/permanentDelete"
+                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsProcessed].id)/permanentDelete"
                         }
                         else {
                             $Method = "DELETE"
-                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsDeleted].id)"
+                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsProcessed].id)"
                         }
                         $request = @{
                             Id          = $x+1
@@ -1248,7 +1251,7 @@ function SearchMailbox {
                             Url         = $Url
                         }
                         $requests.Add($request) | Out-Null
-                        $itemsDeleted++
+                        $itemsProcessed++
                     }
                     $batchRequest = @{
                         Requests = $requests
@@ -1260,20 +1263,25 @@ function SearchMailbox {
                     if($batchDeleteResponse.Successful -eq $false){
                         Write-Log "Batch request to delete items failed." -Level WARN
                         Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
-                        continue
+                        $itemsFailedDelete = $itemsFailedDelete + $BatchSize
                     }
                     else{
                         #Check the response for each delete request
                         foreach($response in $batchDeleteResponse.Content.Responses){
                             if($response.status -ne 204){
                                 Write-Log $response.Body.Error.Message -Level WARN
+                                $itemsFailedDelete++
+                            }
+                            else{
+                                $itemsDeleted++
                             }
                         }
                     }
-
-
                 }
                 Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsDeleted items processed." -Level INFO
+                if($itemsFailedDelete -gt 0){
+                    Write-Log "Delete failed for $itemsFailedDelete items in $($MailboxFolder.displayName) folder." -Level WARN
+                }
             }
         }
     }   
@@ -1357,43 +1365,63 @@ function GetFolderList{
             $Script:folderList.Add($Result) | Out-Null
         }
     }
+    
     Write-Log "Folder enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
     BuildFolderListTree
 }
+
 function BuildFolderListTree{
-    Write-Log "Getting list of subfolders..." -Level DEBUG
-    #Create an arraylist to hold the folder tree results
-    $Script:folderListTree = New-Object System.Collections.ArrayList
-    $foundFolders = 0
-    #Start with the root folder and add it to the tree
-    $Script:folderList | Where-Object { ($_.parentFolderId -notin ($Script:folderList | ForEach-Object { $_.id })) } | ForEach-Object { 
-        $_.displayName = "\$($_.displayName)"
-        $Script:folderListTree.Add($_) | Out-Null
-        $foundFolders++
-    }
-    #Loop through the folder list to find all folders under the root
-    foreach($folder in $Script:folderList){
-        if($folder.parentFolderId -eq $rootFolderId.id){
-            $folder.displayName = "\$($folder.displayName)"
-            $Script:folderListTree.Add($folder) | Out-Null
-            $foundFolders++
-        }
+    Write-Log "Generating folder hierarchy structure for folders" -Level DEBUG
+    $foldersById = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+    $namesById = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    $pathCache = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+
+    foreach ($folder in $Script:folderList) {
+        $foldersById[[string]$folder.id] = $folder
+        $namesById[[string]$folder.id] = $folder.displayName
     }
 
-    #Loop through until all folders are found
-    while($foundFolders -lt $Script:folderList.Count){
-        foreach($folder in $Script:folderList){
-            foreach($treeFolder in $Script:folderListTree){
-                if($folder.parentFolderId -eq $treeFolder.id){
-                    $folder.displayName = "$($treeFolder.displayName)\$($folder.displayName)"
-                    $Script:folderListTree.Add($folder) | Out-Null
-                    $foundFolders++
-                    break
-                }
-            }
+    function Resolve-FolderPath {
+        param(
+            [object]$Folder,
+            [System.Collections.Generic.HashSet[string]]$Visiting
+        )
+
+        $folderId = [string]$Folder.id
+
+        if ($pathCache.ContainsKey($folderId)) {
+            return $pathCache[$folderId]
         }
+
+        if (-not $Visiting.Add($folderId)) {
+            throw "Circular folder relationship detected at folder '$folderId'."
+        }
+
+        $name = $namesById[$folderId]
+        $parentId = [string]$Folder.parentFolderId
+
+        if ([string]::IsNullOrEmpty($parentId) -or -not $foldersById.ContainsKey($parentId)) {
+            $path = "\$name"
+        }
+        else {
+            $parentPath = Resolve-FolderPath -Folder $foldersById[$parentId] -Visiting $Visiting
+            $path = "$parentPath\$name"
+        }
+
+        [void]$Visiting.Remove($folderId)
+        $pathCache[$folderId] = $path
+
+        return $path
     }
-    $Script:folderListTree = $Script:folderListTree | Sort-Object displayName
+
+    foreach ($folder in $Script:folderList) {
+        $visiting = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $folder.displayName = Resolve-FolderPath -Folder $folder -Visiting $visiting
+    }
+
+    $Script:folderListTree = @(
+        $Script:folderList | Sort-Object displayName
+    )
 }
 
 function GetRecoverableItemsFolderList{
