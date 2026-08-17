@@ -1143,14 +1143,32 @@ function SearchMailbox {
         }
         foreach($Result in $SearchItems.Content.Value){
             $Global:MailboxSearchResults = $Result
-            $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-
+            if([string]::IsNullOrEmpty($AttachmentName)){
+                $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+            }
+            else{
+                foreach($attachment in $Result.Attachments){
+                    if($attachment.name -eq $AttachmentName){
+                        write-log "Attachment $($AttachmentName) found in message $($Result.subject) in folder $($MailboxFolder.displayName)" -Level INFO
+                        $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
+                    }
+                }
+            }
         }
         while($null -ne $SearchItems.Content.'@odata.nextLink'){
             $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
             $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
             foreach($Result in $SearchItems.Content.Value){
-                $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+                if([string]::IsNullOrEmpty($AttachmentName)){
+                    $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+                }
+                else{
+                    foreach($attachment in $Result.Attachments){
+                        if($attachment.name -eq $AttachmentName){
+                            $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
+                        }
+                    }
+                }
             }
         }
         Write-Log ([string]::Format("Found {0} items in the {1} folder.", $Script:folderSearchResults.Count, $MailboxFolder.displayName)) -Level INFO
