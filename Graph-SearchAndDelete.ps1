@@ -1077,6 +1077,41 @@ function Get-OAuthToken {
     }    
 }
 
+function Check-FilterResults{
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Result
+    )
+    #Check if attachment name is specified
+    if(-not([string]::IsNullOrEmpty($AttachmentName))){
+        $attachmentFound = $false
+        foreach($attachment in $Result.Attachments){
+            if($attachment.name -eq $AttachmentName){
+                $attachmentFound = $true
+                break
+            }
+        }
+        #if(-not($attachmentFound)){
+        #    return
+        #}
+    }
+    
+    #Check if message body is specified
+    if(-not([string]::IsNullOrEmpty($MessageBody))){
+        $bodyFound = $false
+        if($Result.body -match $MessageBody){
+            $bodyFound = $true
+        }
+    }
+    
+    #Add result to search results
+    if((-not([string]::IsNullOrEmpty($AttachmentName)) -and $attachmentFound) -and (([string]::IsNullOrEmpty($MessageBody)) -or $bodyFound)){
+        $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
+    }
+    elseif(([string]::IsNullOrEmpty($AttachmentName) -or $attachmentFound) -and (-not([string]::IsNullOrEmpty($MessageBody)) -and $bodyFound)){
+        $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+    }
+}
 function SearchMailbox {
     param(
         [string]$uriQuery
@@ -1084,6 +1119,7 @@ function SearchMailbox {
     Write-Log "Performing search against the mailbox..." -Level INFO
     #Array to hold the search results for all folders
     $Script:SearchResults = New-Object System.Collections.ArrayList
+    $Global:TestResults = New-Object System.Collections.ArrayList
     #Perform the search against each folder
     foreach($MailboxFolder in $Script:searchFolders) {
         #Array to hold the search results for the current folder to be used for deletion if the delete switch is set
@@ -1143,32 +1179,13 @@ function SearchMailbox {
             continue
         }
         foreach($Result in $SearchItems.Content.Value){
-            if([string]::IsNullOrEmpty($AttachmentName)){
-                $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-            }
-            else{
-                foreach($attachment in $Result.Attachments){
-                    Write-Log "checking attachment $($attachment.name) against $($AttachmentName)" -Level info
-                    if($attachment.name -eq $AttachmentName){
-                        $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
-                    }
-                }
-            }
+            Check-FilterResults -Result $Result
         }
         while($null -ne $SearchItems.Content.'@odata.nextLink'){
             $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
             $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
             foreach($Result in $SearchItems.Content.Value){
-                if([string]::IsNullOrEmpty($AttachmentName)){
-                    $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-                }
-                else{
-                    foreach($attachment in $Result.Attachments){
-                        if($attachment.name -eq $AttachmentName){
-                            $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
-                        }
-                    }
-                }
+                Check-FilterResults -Result $Result
             }
         }
         Write-Log ([string]::Format("Found {0} items in the {1} folder.", $Script:folderSearchResults.Count, $MailboxFolder.displayName)) -Level INFO
@@ -1233,7 +1250,6 @@ function SearchMailbox {
 }    
 function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
-        if([string]::IsNullOrEmpty($MessageBody) -and [string]::IsNullOrEmpty($AttachmentName)) {
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
                 $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
@@ -1280,66 +1296,7 @@ function CreateSearchQuery {
                     $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=500"
                 }
             }
-        }
-        else {
-            # Build the search query based on specified parameters
-            Write-Log "Creating a query using the search function." -Level DEBUG
-            #Add message body to the search query
-            if(-not([string]::IsNullOrEmpty($MessageBody))){
-                $UriFilter = "`$search=`"body:$MessageBody`"&`$top=250"
-            }
-            #Check if the sender is specified and build the search query accordingly
-            if(-not([string]::IsNullOrEmpty($Sender))){
-                if($UriFilter -like '*search*'){
-                    $UriFilter = $UriFilter.Replace('search="', "search=`"from:$Sender` AND ")
-                }
-                else{
-                    $UriFilter = "`$search=`"from:$Sender`"&`$top=250"
-                }
-            }
-            #Check if the subject is specified and build the search query accordingly
-            if(-not([string]::IsNullOrEmpty($Subject))){
-                if($UriFilter -like '*search*'){
-                    $UriFilter = $UriFilter.Replace('search="', "search=`"subject:$Subject` AND ")
-                }
-                else{
-                    $UriFilter = "`$search=`"subject:$Subject`"&`$top=250&`$select=id,parentfolderid,receivedDateTime,subject,from"#&`$from=$PageNumber"
-                }
-            }
-            #Check if the created before and after dates are specified and build the search query accordingly
-            if(-not([string]::IsNullOrEmpty($CreatedBefore))){
-                $TempStartDate = [datetime]$CreatedBefore
-                $TempStartDate = $TempStartDate.ToUniversalTime()
-                $SearchBeforeDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempStartDate
-                if($UriFilter -like '*search*'){
-                    $UriFilter = $UriFilter.Replace('search="', "search=`"received<=$SearchBeforeDate AND ")
-                }
-                else{
-                    $UriFilter = "`$search=`"received<=$SearchBeforeDate`"&`$top=25"
-                }
-            }
-            #Check if the created after date is specified and build the search query accordingly
-            if(-not([string]::IsNullOrEmpty($CreatedAfter))){
-                $TempStartDate = [datetime]$CreatedAfter
-                $TempStartDate = $TempStartDate.ToUniversalTime()
-                $SearchAfterDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempStartDate
-                if($UriFilter -like '*search*'){
-                    $UriFilter = $UriFilter.Replace('search="', "search=`"received>=$SearchAfterDate AND ")
-                }
-                else{
-                    $UriFilter = "`$search=`"received>=$SearchAfterDate`"&`$top=25"
-                }
-            }
-            if(-not([string]::IsNullOrEmpty($AttachmentName))){
-                if($UriFilter -like '*search*'){
-                    $UriFilter = $UriFilter.Replace('search="', "search=`"attachment:$($AttachmentName) AND ")
-                    $UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
-                }
-                else{
-                    $UriFilter = "`$search=`"attachment:$($AttachmentName)&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=25"
-                }
-            }
-        }
+        
         return $UriFilter    
 }
     
