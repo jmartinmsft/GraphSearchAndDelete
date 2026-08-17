@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260816.2050
+# Version 20260817.1413
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -1160,7 +1160,14 @@ function SearchMailbox {
             #Build the search query based on the parameters provided to the script
             $UriFilter = CreateSearchQuery
         }
-
+        <#
+        if($UriFilter -notmatch 'top='){
+            $UriFilter = "$($UriFilter)&`$top=1"
+        }
+        else{
+            $UriFilter.Replace("top=500","top=1")
+        }
+        #>
         # Search the mailbox for items
         $SearchParams = @{
             GraphApiUrl     = $cloudService.graphApiEndpoint
@@ -1229,11 +1236,11 @@ function SearchMailbox {
                     for($x=0; $x -lt $BatchSize; $x++){
                         if($HardDelete){
                             $Method = "POST"
-                            $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsDeleted].id)/permanentDelete"
+                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsDeleted].id)/permanentDelete"
                         }
                         else {
                             $Method = "DELETE"
-                            $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsDeleted].id)"
+                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsDeleted].id)"
                         }
                         $request = @{
                             Id          = $x+1
@@ -1248,7 +1255,23 @@ function SearchMailbox {
                     } | ConvertTo-Json -Depth 6
 
                     Write-Log "Sending batch delete request ($BatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
-                    Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest | Out-Null
+                    $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest
+                    #Check the responses from the batch for any failures
+                    if($batchDeleteResponse.Successful -eq $false){
+                        Write-Log "Batch request to delete items failed." -Level WARN
+                        Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
+                        continue
+                    }
+                    else{
+                        #Check the response for each delete request
+                        foreach($response in $batchDeleteResponse.Content.Responses){
+                            if($response.status -ne 204){
+                                Write-Log $response.Body.Error.Message -Level WARN
+                            }
+                        }
+                    }
+
+
                 }
                 Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsDeleted items processed." -Level INFO
             }
