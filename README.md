@@ -8,14 +8,12 @@ This script can be used to search and delete content from a mailbox. The search 
 ## Requirements
 1. The script requires an application registration in Entra ID that has the Microsoft Graph Mail.ReadWrite and User.Read.All permission.
 
-## Note
-Message body searches are limited to 275 results per folder. Multiple runs are needed to delete more than 275 items from a folder.
 
 ## Usage
 Search the Inbox for items from a sender and only generate a CSV file with the results:
 ```powershell
 $secret = ConvertTo-SecureString -String "AppRegSecretInEntra" -AsPlainText -Force
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\Output -SenderAddress kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\Output -Sender kelly@contoso.com -IncludeFolderList Inbox -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 ```
 Search the entire mailbox for items containing a subject and message body and delete those items in batches of 10 items:
 ```powershell
@@ -23,11 +21,11 @@ Search the entire mailbox for items containing a subject and message body and de
 ```
 Search the recoverable items for items within a date range and delete those items:
 ```powershell
-.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -CreatedAfter 2024-01-01 -CreatedBefore 2024-01-31 -SearchDumpster -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
+.\Graph-SearchAndDelete.ps1 -Mailbox jim@contoso.com -OutputPath C:\Temp\ -ReceivedAfter 2024-01-01 -ReceivedBefore 2024-01-31 -SearchDumpster -DeleteContent -OAuthClientId 2e542266-a1b2-4567-8901-abcdccd61976 -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthClientSecret $secret
 ```
 Search the archive mailbx (including aux archive mailboxes) for items containing the subject Graph from sender shared@contoso.com that were sent before a date in the GraphArchive folder
 ```powershell
-.\Graph-SearchAndDelete.ps1 -OAuthClientId 7fc9c210-fa39-4c7a-83b8-9c6970b3c16a -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthCertificate 7765BEC834A02110DF8686D13436ABC8BE265917 -CertificateStore CurrentUser -PermissionType Application -Mailbox jim@contoso.com -Archive -IncludeFolderList GraphArchive -CreatedBefore (Get-Date -Date '7/23/2026') -Sender shared@contoso.com -Subject Graph
+.\Graph-SearchAndDelete.ps1 -OAuthClientId 7fc9c210-fa39-4c7a-83b8-9c6970b3c16a -OAuthTenantId 9101fc97-a2e6-2255-a2d5-83e051e52057 -OAuthCertificate 7765BEC834A02110DF8686D13436ABC8BE265917 -CertificateStore CurrentUser -PermissionType Application -Mailbox jim@contoso.com -Archive -IncludeFolderList GraphArchive -ReceivedBefore (Get-Date -Date '7/23/2026') -Sender shared@contoso.com -Subject Graph
 ```
 
 ## Parameters
@@ -44,9 +42,9 @@ Search the archive mailbx (including aux archive mailboxes) for items containing
 
 **SearchDumpster** - The SearchDumpster parameter is a switch to search the recoverable items.
 
-**CreatedBefore** - The CreatedBefore parameter specifies only messages created before this date will be searched.
+**ReceivedBefore** - The ReceivedBefore parameter specifies only messages received before this date will be searched.
 
-**CreatedAfter** - The CreatedAfter parameter specifies only messages created after this date will be searched.
+**ReceivedAfter** - The ReceivedAfter parameter specifies only messages received after this date will be searched.
 
 **Subject** - The Subject paramter specifies the subject string used by the search.
 
@@ -78,10 +76,10 @@ Search the archive mailbx (including aux archive mailboxes) for items containing
 
 **Scope** - The Scope parameter specifies the API permissions
 
-**OutputPath** - The OutputPath parameter specifies the path for the EWS usage report.
-
-**LogFile** - The LogFile parameter specifies the full path for the script log file. If not specified, a log file is created in the OutputPath.
-
 **BatchSize** - The BatchSize parameter specifies how many items to delete within a batch request.
+
+**ResultSize** - The ResultSize parameter specifies the number of items to returned in each query.
+
+**OutputPath** - The OutputPath parameter specifies the path for the EWS usage report.
 
 **ConfirmDelete** - The Confirm switch specifies whether to prompt for confirmation before performing delete actions.
