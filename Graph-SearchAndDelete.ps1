@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260817.2019
+# Version 20260818.1216
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -30,16 +30,16 @@ param (
     [string]$Mailbox,
 
     [Parameter(Mandatory=$False, HelpMessage="The Archive parameter is a switch to search the archive mailbox (otherwise, the main mailbox is searched).")]
-    [alias("SearchArchive")] [switch]$Archive,
+    [switch]$Archive,
 
     [Parameter(Mandatory=$False, HelpMessage="The ProcessSubfolders parameter is a switch to enable searching the subfolders of any specified folder.")]
     [switch]$ProcessSubfolders,
 
-    [Parameter(Mandatory=$False, HelpMessage="The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the Inbox folder will be searched).  Any exclusions override this list.")]
-    $IncludeFolderList,
+    [Parameter(Mandatory=$False, HelpMessage="The IncludeFolderList parameter specifies the folder(s) to be searched (if not present, then the entire mailbox will be searched).  Any exclusions override this list.")]
+    [object]$IncludeFolderList,
 
     [Parameter(Mandatory=$False, HelpMessage="The ExcludeFolderList parameter specifies the folder(s) to be excluded (these folders will not be searched).")]
-    $ExcludeFolderList,
+    [object]$ExcludeFolderList,
 
     [Parameter(Mandatory=$false,HelpMessage="The SearchDumpster parameter is a switch to search the recoverable items.")] 
     [switch]$SearchDumpster,
@@ -100,12 +100,13 @@ param (
     [ValidateRange(1, 20)]
     [int]$BatchSize = 20,
 
-    [ValidateScript({ Test-Path $_ })]
-    [Parameter(Mandatory = $false, HelpMessage="The OutputPath parameter specifies the path for the EWS usage report.")]
-    [string] $OutputPath,
+    [Parameter(Mandatory = $false, HelpMessage="The ResultSize parameter specifies the number of items to returned in each query.")]
+    [ValidateRange(1, 500)]
+    [int]$ResultSize = 500,
 
-    [Parameter(Mandatory = $false, HelpMessage="The LogFile parameter specifies the full path for the script log file. If not specified, a log file is created in the OutputPath.")]
-    [string] $LogFile,
+    [ValidateScript({ Test-Path $_ })]
+    [Parameter(Mandatory = $true, HelpMessage="The OutputPath parameter specifies the path for the EWS usage report.")]
+    [string]$OutputPath,
 
     [Parameter(Mandatory = $false, HelpMessage="The Confirm switch specifies whether to prompt for confirmation before performing delete actions.")]
     [boolean]$ConfirmDelete=$true
@@ -132,15 +133,12 @@ function Write-Log {
 }
 
 # Initialize log file
-if ([string]::IsNullOrEmpty($LogFile)) {
+
     if (-not([string]::IsNullOrEmpty($OutputPath))) {
         $Script:LogFile = Join-Path $OutputPath "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     } else {
         $Script:LogFile = Join-Path $PSScriptRoot "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     }
-} else {
-    $Script:LogFile = $LogFile
-}
 
 Write-Log "Script started. Mailbox: $Mailbox | Archive: $Archive | SearchDumpster: $SearchDumpster | PermissionType: $PermissionType"
 Write-Log "Output path: $OutputPath | Log file: $Script:LogFile"
@@ -1157,9 +1155,12 @@ function SearchMailbox {
         }
         
         #Use the same search query for all folders, so only build it once if it hasn't been built yet
-        if(-not($UriFilter)) {
+        if([string]::IsNullOrEmpty($UriFilter)) {
             #Build the search query based on the parameters provided to the script
             $UriFilter = CreateSearchQuery
+        }
+        if($UriFilter -notlike "*top=$($ResultSize)"){
+            $UriFilter = "$($UriFilter)&`$top=$($ResultSize)"
         }
         <#
         if($UriFilter -notmatch 'top='){
@@ -1290,7 +1291,7 @@ function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
-                $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=500"
+                $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=$($ResultSize)"
             }
             #Check if the created before and after dates are specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($CreatedBefore))) {
@@ -1298,10 +1299,10 @@ function CreateSearchQuery {
                 $TempStartDate = $TempStartDate.ToUniversalTime()
                 $SearchStartDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempStartDate
                 if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime le $($SearchStartDate) and ")
+                    $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime lt $($SearchStartDate) and ")
                 }
                 else {
-                    $UriFilter = "`$filter=receivedDateTime le $($SearchStartDate)&`$top=500"
+                    $UriFilter = "`$filter=receivedDateTime lt $($SearchStartDate)&`$top=$($ResultSize)"
                 }
             }
             #Check if the created after date is specified and build the filter query accordingly
@@ -1310,10 +1311,10 @@ function CreateSearchQuery {
                 $TempEndDate = $TempEndDate.ToUniversalTime()
                 $SearchEndDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempEndDate
                 if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime ge $($SearchEndDate) and ")
+                    $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime gt $($SearchEndDate) and ")
                 }
                 else {
-                    $UriFilter = "`$filter=receivedDateTime ge $($SearchEndDate)&`$top=500"
+                    $UriFilter = "`$filter=receivedDateTime gt $($SearchEndDate)&`$top=$($ResultSize)"
                 }
             }
             #Check if the sender is specified and build the filter query accordingly
@@ -1322,16 +1323,17 @@ function CreateSearchQuery {
                     $UriFilter = $UriFilter.Replace('filter=', "filter=(from/emailAddress/address) eq `'$Sender`' and ")
                 }
                 else {
-                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'&`$top=500"
+                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'&`$top=$($ResultSize)"
                 }
             }
             if(-not([string]::IsNullOrEmpty($AttachmentName))){
                 if($UriFilter -like '*filter*'){
                     $UriFilter = $UriFilter.Replace('filter=', "filter=hasAttachments eq true and ")
-                    $UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
+                    $UriFilter = $UriFilter.Replace("&`$top=$($ResultSize)","&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=$($ResultSize)")
+                    #$UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
                 }
                 else {
-                    $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=500"
+                    $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=$($ResultSize)"
                 }
             }
         
@@ -1482,6 +1484,30 @@ function GetRecoverableItemsFolderList{
     Write-Log "Recoverable items enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
 }
 
+#Ensure the IncludeFolderList and ExcludeFolderList values all start with a backslash to match the folder display names
+if(-not([string]::IsNullOrEmpty($IncludeFolderList))){
+    # Convert to array if only one entry provided as a string
+    if($IncludeFolderList -isnot [System.Collections.ArrayList] -and $IncludeFolderList -isnot [array]){
+        $IncludeFolderList = @($IncludeFolderList)
+    }
+    foreach($folder in $IncludeFolderList){
+        if(-not($folder.StartsWith("\"))){
+            $IncludeFolderList[$IncludeFolderList.IndexOf($folder)] = "\" + $folder
+        }
+    }
+}
+if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
+    # Convert to array if only one entry provided as a string
+    if($ExcludeFolderList -isnot [System.Collections.ArrayList] -and $ExcludeFolderList -isnot [array]){
+        $ExcludeFolderList = @($ExcludeFolderList)
+    }
+    foreach($folder in $ExcludeFolderList){
+        if(-not($folder.StartsWith("\"))){
+            $ExcludeFolderList[$ExcludeFolderList.IndexOf($folder)] = "\" + $folder
+        }
+    }
+}
+
 #Get parameters and pass to obtain an OAuth token
 $cloudService = Get-CloudServiceEndpoint $AzureEnvironment
 $azureADEndpoint = $cloudService.AzureADEndpoint
@@ -1555,19 +1581,18 @@ else {
     if($ProcessSubfolders){
         foreach($folder in $IncludeFolderList){
             #Add all subfolders of the specified folder to the search list
-            $Script:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName.split('\')[-1] -eq $folder })) | Out-Null
-            $subfolders = ($Script:folderListTree | Where-Object { $_ -match "\\$($folder)($|\\)" })
-            foreach($subfolder in $subfolders){
-                $Script:searchFolders.Add($subfolder) | out-null
+            $includeFolders = ($Script:folderListTree | Where-Object { $_.displayName -match "^" + [regex]::Escape($folder) + "($|\\)"})
+            foreach($iFolder in $includeFolders){
+                $Script:searchFolders.Add($iFolder) | Out-Null
             }
         }
     }
     else {
         #Add only the specified folders to the search list
         foreach($folder in $IncludeFolderList){
-            $Script:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName.split('\')[-1] -eq $folder })) | Out-Null
+            [void]$Script:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName -eq $folder }))
             if($Archive){
-                $subfolders = ($Script:folderListTree | Where-Object { $_ -match "\\$($folder)($|\\)" })
+                $subfolders = ($Script:folderListTree | Where-Object { $_.displayName -match "^" + [regex]::Escape($folder) + "($|\\)"})
                 #Include any subfolders that were created by the aux archive mailbox
                 $auxSubfolders = $subfolders | Where-Object {
                     $parts = $_ -split '\\'
