@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260818.1216
+# Version 20260818.1618
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -72,11 +72,11 @@ param (
     [Parameter(Mandatory=$false)]
     [object]$Scope= @("Mail.ReadWrite"),
 
-    [Parameter(Mandatory=$false, HelpMessage="The CreatedBefore parameter specifies only messages created before this date will be searched.")] 
-    [DateTime]$CreatedBefore,
+    [Parameter(Mandatory=$false, HelpMessage="The ReceivedBefore parameter specifies only messages received before this date will be searched.")] 
+    [DateTime]$ReceivedBefore,
     
-    [Parameter(Mandatory=$false, HelpMessage="The CreatedAfter parameter specifies only messages created after this date will be searched.")] 
-    [DateTime]$CreatedAfter,
+    [Parameter(Mandatory=$false, HelpMessage="The ReceivedAfter parameter specifies only messages received after this date will be searched.")] 
+    [DateTime]$ReceivedAfter,
     
     [Parameter(Mandatory=$False,HelpMessage="The Subject parameter specifies the subject string used by the search.")] 
     [string]$Subject=$null,
@@ -1095,7 +1095,7 @@ function Check-FilterResults{
     #Check if message body is specified
     if(-not([string]::IsNullOrEmpty($MessageBody))){
         $bodyFound = $false
-        if($Result.body -match $MessageBody){
+        if(-not([string]::IsNullOrEmpty($Result.body.content)) -and $Result.body.content.IndexOf($MessageBody, [StringComparison]::OrdinalIgnoreCase) -ge 0){
             $bodyFound = $true
         }
     }
@@ -1115,13 +1115,13 @@ function SearchMailbox {
     Write-Log "Performing search against the mailbox..." -Level INFO
     #Array to hold the search results for all folders
     $Script:SearchResults = New-Object System.Collections.ArrayList
-    $Global:TestResults = New-Object System.Collections.ArrayList
     #Perform the search against each folder
     foreach($MailboxFolder in $Script:searchFolders) {
         #Array to hold the search results for the current folder to be used for deletion if the delete switch is set
         $Script:folderSearchResults = New-Object System.Collections.ArrayList
         Write-Log "Searching folder: $($MailboxFolder.displayName)" -Level INFO
         Write-Log "Processing folder: $($MailboxFolder.id)" -level DEBUG
+        [int]$searchFailures=0
         if($Archive){
             #Check to see if the folder is in the main archive or an aux archive
             $Uri = "admin/exchange/mailboxes/$($Script:userMailbox)/folders/$($MailboxFolder.id)"
@@ -1159,17 +1159,6 @@ function SearchMailbox {
             #Build the search query based on the parameters provided to the script
             $UriFilter = CreateSearchQuery
         }
-        if($UriFilter -notlike "*top=$($ResultSize)"){
-            $UriFilter = "$($UriFilter)&`$top=$($ResultSize)"
-        }
-        <#
-        if($UriFilter -notmatch 'top='){
-            $UriFilter = "$($UriFilter)&`$top=1"
-        }
-        else{
-            $UriFilter.Replace("top=500","top=1")
-        }
-        #>
         # Search the mailbox for items
         $SearchParams = @{
             GraphApiUrl     = $cloudService.graphApiEndpoint
@@ -1182,29 +1171,43 @@ function SearchMailbox {
         if($SearchItems.Successful -eq $false){
             Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
             Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
+            $searchFailures++
             continue
         }
-        foreach($Result in $SearchItems.Content.Value){
-            if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
-                Check-FilterResults -Result $Result
-            }
-            else{
-                $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-            }
-        }
-        while($null -ne $SearchItems.Content.'@odata.nextLink'){
-            $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
-            $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+        else{
             foreach($Result in $SearchItems.Content.Value){
                 if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
-                   Check-FilterResults -Result $Result
+                    Check-FilterResults -Result $Result
                 }
                 else{
                     $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
                 }
             }
+            while($null -ne $SearchItems.Content.'@odata.nextLink'){
+                $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
+                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+                if($SearchItems.Successful -eq $false){
+                    Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
+                    Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
+                    $searchFailures++
+                    continue
+                }
+                else{
+                    foreach($Result in $SearchItems.Content.Value){
+                        if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
+                            Check-FilterResults -Result $Result
+                        }
+                        else{
+                            $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+                        }
+                    }
+                }
+            }
         }
         Write-Log ([string]::Format("Found {0} items in the {1} folder.", $Script:folderSearchResults.Count, $MailboxFolder.displayName)) -Level INFO
+        if($searchFailures -gt 0){
+            Write-Log ([string]::Format("Search for {0} folder in mailbox {1} had {2} failures.", $MailboxFolder.displayName, $mailboxName, $searchFailures)) -Level WARN
+        }
         #Add the folder results to the total list of results
         $Script:SearchResults.AddRange($Script:folderSearchResults)
 
@@ -1224,20 +1227,22 @@ function SearchMailbox {
                 [int]$itemsDeleted = 0
                 [int]$itemsFailedDelete = 0
                 [int]$itemsProcessed = 0
+                #prevent batch size being reduced from previous folder search results
+                $currentBatchSize = $BatchSize
                 # Make sure the results are not less than the batch size
-                if($Script:folderSearchResults.count -lt $BatchSize){
-                    $BatchSize = $Script:folderSearchResults.Count
+                if($Script:folderSearchResults.count -lt $currentBatchSize){
+                    $currentBatchSize = $Script:folderSearchResults.Count
                 }
                 $Query = "`$batch"
                 # Loop thru the results creating batches to delete
                 while($itemsProcessed -lt $Script:folderSearchResults.Count){
                     # Make sure the batch size is not greater than the items left to process
-                    if(($Script:folderSearchResults.Count - $itemsProcessed) -lt $BatchSize){
-                        $BatchSize = $Script:folderSearchResults.Count - $itemsProcessed
+                    if(($Script:folderSearchResults.Count - $itemsProcessed) -lt $currentBatchSize){
+                        $currentBatchSize = $Script:folderSearchResults.Count - $itemsProcessed
                     }
                     #Create an array of requests to send to the batch endpoint
                     $requests = New-Object System.Collections.ArrayList
-                    for($x=0; $x -lt $BatchSize; $x++){
+                    for($x=0; $x -lt $currentBatchSize; $x++){
                         if($HardDelete){
                             $Method = "POST"
                             $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsProcessed].id)/permanentDelete"
@@ -1258,13 +1263,13 @@ function SearchMailbox {
                         Requests = $requests
                     } | ConvertTo-Json -Depth 6
 
-                    Write-Log "Sending batch delete request ($BatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
+                    Write-Log "Sending batch delete request ($currentBatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
                     $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest
                     #Check the responses from the batch for any failures
                     if($batchDeleteResponse.Successful -eq $false){
                         Write-Log "Batch request to delete items failed." -Level WARN
                         Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
-                        $itemsFailedDelete = $itemsFailedDelete + $BatchSize
+                        $itemsFailedDelete = $itemsFailedDelete + $currentBatchSize
                     }
                     else{
                         #Check the response for each delete request
@@ -1291,52 +1296,60 @@ function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
-                $UriFilter = "`$filter=contains(subject,`'$Subject`')&`$top=$($ResultSize)"
+                $Subject = $Subject.Replace("'", "''")
+                $Subject = [Uri]::EscapeDataString($Subject)
+                $UriFilter = "`$filter=contains(subject,`'$Subject`')"
             }
-            #Check if the created before and after dates are specified and build the filter query accordingly
-            if(-not([string]::IsNullOrEmpty($CreatedBefore))) {
-                $TempStartDate = [datetime]$CreatedBefore
+            #Check if the received before and after dates are specified and build the filter query accordingly
+            if(-not([string]::IsNullOrEmpty($ReceivedBefore))) {
+                $TempStartDate = [datetime]$ReceivedBefore
                 $TempStartDate = $TempStartDate.ToUniversalTime()
                 $SearchStartDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempStartDate
                 if($UriFilter -like '*filter*'){
                     $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime lt $($SearchStartDate) and ")
                 }
                 else {
-                    $UriFilter = "`$filter=receivedDateTime lt $($SearchStartDate)&`$top=$($ResultSize)"
+                    $UriFilter = "`$filter=receivedDateTime lt $($SearchStartDate)"
                 }
             }
-            #Check if the created after date is specified and build the filter query accordingly
-            if(-not([string]::IsNullOrEmpty($CreatedAfter))){
-                $TempEndDate = [datetime]$CreatedAfter
+            #Check if the received after date is specified and build the filter query accordingly
+            if(-not([string]::IsNullOrEmpty($ReceivedAfter))){
+                $TempEndDate = [datetime]$ReceivedAfter
                 $TempEndDate = $TempEndDate.ToUniversalTime()
                 $SearchEndDate = '{0:yyyy-MM-ddTHH:mm:ssZ}' -f $TempEndDate
                 if($UriFilter -like '*filter*'){
                     $UriFilter = $UriFilter.Replace('filter=', "filter=receivedDateTime gt $($SearchEndDate) and ")
                 }
                 else {
-                    $UriFilter = "`$filter=receivedDateTime gt $($SearchEndDate)&`$top=$($ResultSize)"
+                    $UriFilter = "`$filter=receivedDateTime gt $($SearchEndDate)"
                 }
             }
             #Check if the sender is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Sender))){
+                $Sender = $Sender.Replace("'", "''")
+                $Sender = [Uri]::EscapeDataString($Sender)
                 if($UriFilter -like '*filter*'){
                     $UriFilter = $UriFilter.Replace('filter=', "filter=(from/emailAddress/address) eq `'$Sender`' and ")
                 }
                 else {
-                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'&`$top=$($ResultSize)"
+                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'"
                 }
             }
             if(-not([string]::IsNullOrEmpty($AttachmentName))){
                 if($UriFilter -like '*filter*'){
                     $UriFilter = $UriFilter.Replace('filter=', "filter=hasAttachments eq true and ")
-                    $UriFilter = $UriFilter.Replace("&`$top=$($ResultSize)","&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=$($ResultSize)")
-                    #$UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
+                    $UriFilter = "$($UriFilter)&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
                 }
                 else {
-                    $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)&`$top=$($ResultSize)"
+                    $UriFilter = "`$filter=hasAttachments eq true&`$expand=attachments(`$select=id,name,contentType,size,isInline)"
                 }
             }
-        
+            if([string]::IsNullOrEmpty($MessageBody)){
+                $UriFilter = "$($UriFilter)&`$select=id,subject,receivedDateTime,from,internetMessageId,hasAttachments&`$top=$($ResultSize)"
+            }
+            else{
+                $UriFilter = "$($UriFilter)&`$select=id,subject,receivedDateTime,from,internetMessageId,hasAttachments,body&`$top=$($ResultSize)"
+            }
         return $UriFilter    
 }
     
@@ -1484,6 +1497,12 @@ function GetRecoverableItemsFolderList{
     Write-Log "Recoverable items enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
 }
 
+#Safety check to ensure the search is not against the entire mailbox and ConfirmDelete is set to false which would result in all items being deleted from the mailbox
+if((([string]::IsNullOrEmpty($IncludeFolderList)) -and ([string]::IsNullOrEmpty($ExcludeFolderList)) -and $ConfirmDelete -eq $false) -and $DeleteContent){
+    Write-Log "Both IncludeFolderList and ExcludeFolderList are not specified and ConfirmDelete is set to false. This could result in all items being deleted from the mailbox. Please review the parameters and try again." -Level ERROR
+    exit
+}
+
 #Ensure the IncludeFolderList and ExcludeFolderList values all start with a backslash to match the folder display names
 if(-not([string]::IsNullOrEmpty($IncludeFolderList))){
     # Convert to array if only one entry provided as a string
@@ -1616,7 +1635,7 @@ if($ExcludeFolderList){
     Write-Log "Removing excluded folders from the list..." -Level INFO
     #Find all folders that match the exclude list and add them to the remove list
     foreach ($exclude in $ExcludeFolderList) {
-        $removeFolderList.Add(($Script:searchFolders | Where-Object { $_.displayName.split('\')[-1] -eq $exclude})) | Out-Null
+        [void]$removeFolderList.Add(($Script:searchFolders | Where-Object { $_.displayName -eq $exclude}))
     }
     #Remove the excluded folders and all subfolders from the search list
     if($removeFolderList.Count -gt 0){
@@ -1624,7 +1643,7 @@ if($ExcludeFolderList){
         foreach($folder in $Script:searchFolders){
             $shouldExclude = $false
             foreach($exclude in $ExcludeFolderList){
-                if($folder.displayName -match "\\$([regex]::Escape($exclude))($|\\)"){
+                if($folder.displayName.StartsWith("$exclude\",[StringComparison]::OrdinalIgnoreCase) -or $folder.displayName -eq $exclude){
                     $shouldExclude = $true
                     break
                 }
