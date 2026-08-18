@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260818.1618
+# Version 20260818.1739
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -81,7 +81,8 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="The Subject parameter specifies the subject string used by the search.")] 
     [string]$Subject=$null,
     
-    [Parameter(Mandatory=$False,HelpMessage="The Sender parameter specifies the sender email address used by the search.")] 
+    [Parameter(Mandatory=$False,HelpMessage="The Sender parameter specifies the sender email address used by the search.")]
+    [ValidatePattern("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$|^$")]
     [string]$Sender=$null,
 
     [Parameter(Mandatory=$False,HelpMessage="The MessageBody parameter specifies the body string used by the search.")] 
@@ -1213,8 +1214,20 @@ function SearchMailbox {
 
         #Delete items now to ensure correct mailbox using batches
         if($DeleteContent -and $Script:folderSearchResults.count -gt 0){
+            if($searchFailures -gt 0){
+                Write-Log "Warning: There were $searchFailures errors during the search process." -Level WARN
+                $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
+                $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
+                $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
+                $confirmation = $host.ui.PromptForChoice("Search errors detected", "Errors occurred during search. Do you still want to delete the items found?", $options, 1)
+                if($confirmation -eq 1){
+                    Write-Log "User chose not to delete items due to search errors." -Level INFO
+                    continue
+                }
+                $ConfirmDelete = $false
+            }
             #Confirm with the user that they want to continue with the delete since all folders will be searched
-            if($ConfirmDelete){ 
+            elseif($ConfirmDelete){ 
                 $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
                 $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
                 $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
@@ -1501,6 +1514,19 @@ function GetRecoverableItemsFolderList{
 if((([string]::IsNullOrEmpty($IncludeFolderList)) -and ([string]::IsNullOrEmpty($ExcludeFolderList)) -and $ConfirmDelete -eq $false) -and $DeleteContent){
     Write-Log "Both IncludeFolderList and ExcludeFolderList are not specified and ConfirmDelete is set to false. This could result in all items being deleted from the mailbox. Please review the parameters and try again." -Level ERROR
     exit
+}
+#Safety check for an unfiltered search and delete
+if([string]::IsNullOrWhiteSpace($Subject) -and [string]::IsNullOrEmpty($ReceivedBefore) -and [string]::IsNullOrEmpty($ReceivedAfter) -and [string]::IsNullOrEmpty($Sender) -and [string]::IsNullOrWhiteSpace($AttachmentName) -and $DeleteContent){
+    Write-Log "No search filters specified and DeleteContent is set to true. This could result in all items being deleted from the mailbox. Please review the parameters and try again." -Level WARN
+    $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
+    $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
+    $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
+    $confirmation = $host.ui.PromptForChoice("Confirmation", "Do you want to continue with this search?", $options, 1)
+    #Confirm with the user that they want to continue with the search since all content in folders will be deleted
+    if($confirmation -ne 0){
+        Write-Log "Search cancelled by user." -Level WARN
+        exit
+    }
 }
 
 #Ensure the IncludeFolderList and ExcludeFolderList values all start with a backslash to match the folder display names
