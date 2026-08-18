@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260817.1649
+# Version 20260817.2019
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -1239,11 +1239,11 @@ function SearchMailbox {
                     for($x=0; $x -lt $BatchSize; $x++){
                         if($HardDelete){
                             $Method = "POST"
-                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsProcessed].id)/permanentDelete"
+                            $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsProcessed].id)/permanentDelete"
                         }
                         else {
                             $Method = "DELETE"
-                            $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsProcessed].id)"
+                            $Url = "/users/MBX:$($mailboxName)@$($OAuthTenantId)/messages/$($Script:folderSearchResults[$itemsProcessed].id)"
                         }
                         $request = @{
                             Id          = $x+1
