@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260818.2024
+# Version 20260819.0834
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -892,48 +892,81 @@ function Invoke-WebRequestWithProxyDetection {
     } else {
         $params = $ParametersObject
     }
+    #Allow for maximum retries of 4 for throttling. This is a known issue with Graph API where it will return 429 for a period of time and then allow the request to go through.
+    $maxAttempts = 4
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            return Invoke-WebRequest @params
+        } 
+        catch {
+            $response = $_
+            $httpResponse = $response.Exception.Response
+            $statusCode = if ($null -ne $httpResponse) {
+                [int]$httpResponse.StatusCode
+            }
+            else {
+                $null
+            }
+            #Exit the retry loop when the error is not a 429 (Too Many Requests)
+            if($statusCode -ne 429){
+                if($statusCode -eq 308){
+                    Write-Log $response.Exception.Message -Level DEBUG
+                    $Global:redirectResponse = $response
+                    $responseType = $httpResponse.GetType().FullName
+                    #Get the aux archive location from the response headers. The location header is different for PS7 and PS5 so we need to check the type of the response object.
+                    $location = if ($responseType -eq 'System.Net.Http.HttpResponseMessage') {
+                        [string]$httpResponse.Headers.Location
+                    }
+                    else {
+                        [string]$httpResponse.Headers['Location']
+                    }
+                    Write-Log $location -Level DEBUG
+                    return [PSCustomObject]@{
+                            ErrorCode    = "PermanentRedirect"
+                            ErrorMessage  = $location
+                            StatusCode = 308
+                            Successful = $false
+                    }
+                }
+                else{
+                    #Error encountered, read the response body to get the error message and return it to the caller.
+                    $reader = [System.IO.StreamReader]::New($httpResponse.GetResponseStream())
+                    try {
+                        $body = $reader.ReadToEnd()
+                        $responseContent = $body | ConvertFrom-Json
+                    }
+                    finally {
+                        $reader.Dispose()
+                    }
+                    Write-Log "Graph API request failed with status code: $statusCode" -Level DEBUG
+                    Write-Log "Error message: $($responseContent.error.message)" -Level DEBUG
+                    return [PSCustomObject]@{
+                        ErrorCode    = $responseContent.error.code
+                        ErrorMessage   = $responseContent.error.message
+                        StatusCode = [int]$httpResponse.StatusCode
+                        Successful = $false
+                    }
+                }
+            }
+            #If we reach the maximum number of attempts, return an error indicating that the Graph API is throttled.
+            if($attempt -eq $maxAttempts){
+                Write-Log "Graph remained throttled after $maxAttempts attempts." -Level ERROR
+                return [PSCustomObject]@{
+                    ErrorCode    = "TooManyRequests"
+                    ErrorMessage  = $response.Exception.Message
+                    StatusCode = 429
+                    Successful = $false
+                }
+            }
+            $retryAfterSeconds = 0
+            $retryAfter = [string]$httpResponse.Headers['Retry-After']
 
-    try {
-        Invoke-WebRequest @params
-    } 
-    catch {
-        $response = $_
-        Write-Log $response -Level DEBUG
-        if($response.Exception.Response.StatusCode -eq 308 -or $response.Exception.Response.StatusCode -eq "PermanentRedirect"){
-            switch($PSVersionTable.PSVersion.Major){
-                5 {
-                    return [PSCustomObject]@{
-                        ErrorCode    = $response.Exception.Response.StatuDescription
-                        ErrorMessage  = $response.Exception.Response.Headers["Location"]
-                        StatusCode = $response.Exception.Response.StatusCode
-                        Successful = $false
-                    }
-                }
-                7 {
-                    return [PSCustomObject]@{
-                        ErrorCode    = $response.Exception.Response.StatusCode
-                        ErrorMessage  = $response.Exception.Response.Headers.Location.AbsoluteUri
-                        StatusCode = $response.Exception.Response.StatusCode.value__
-                        Successful = $false
-                    }
-                }
+            if (-not [int]::TryParse($retryAfter, [ref]$retryAfterSeconds)) {
+                $retryAfterSeconds = [int][Math]::Pow(2, $attempt)
             }
-        }
-        else{
-            $reader = [System.IO.StreamReader]::New($response.Exception.Response.GetResponseStream())
-            try {
-                $body = $reader.ReadToEnd()
-                $responseContent = $body | ConvertFrom-Json
-            }
-            finally {
-                $reader.Dispose()
-            }
-            return [PSCustomObject]@{
-                ErrorCode    = $responseContent.error.code
-                ErrorMessage   = $responseContent.error.message
-                StatusCode = [int]$response.Exception.Response.StatusCode
-                Successful = $false
-            }
+
+            Write-Log "Graph returned 429. Attempt $attempt of $maxAttempts; retrying after $retryAfterSeconds seconds." -Level WARN
+            Start-Sleep -Seconds ($retryAfterSeconds + 1)
         }
     }
 }
@@ -1539,6 +1572,9 @@ if(-not([string]::IsNullOrEmpty($IncludeFolderList))){
         if(-not($folder.StartsWith("\"))){
             $IncludeFolderList[$IncludeFolderList.IndexOf($folder)] = "\" + $folder
         }
+        if($folder.EndsWith("\")){
+            $IncludeFolderList[$IncludeFolderList.IndexOf($folder)] = $folder.TrimEnd("\")
+        }
     }
 }
 if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
@@ -1549,6 +1585,9 @@ if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
     foreach($folder in $ExcludeFolderList){
         if(-not($folder.StartsWith("\"))){
             $ExcludeFolderList[$ExcludeFolderList.IndexOf($folder)] = "\" + $folder
+        }
+        if($folder.EndsWith("\")){
+            $ExcludeFolderList[$ExcludeFolderList.IndexOf($folder)] = $folder.TrimEnd("\")
         }
     }
 }
