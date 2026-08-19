@@ -8,6 +8,8 @@ This script can be used to search and delete content from a mailbox. The search 
 ## Requirements
 1. The script requires an application registration in Entra ID that has the Microsoft Graph Mail.ReadWrite and User.Read.All permission.
 
+## Note
+The IncludeFolderList and ExcludeFolderList require the full path for the folders. Example: \Inbox\Subfolder\SearchHere
 
 ## Usage
 Search the Inbox for items from a sender and only generate a CSV file with the results:
