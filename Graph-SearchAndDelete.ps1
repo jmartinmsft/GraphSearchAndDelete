@@ -1251,7 +1251,6 @@ function SearchMailbox {
             $Uri = "admin/exchange/mailboxes/$($Script:userMailbox)/folders/$($MailboxFolder.id)"
             $FolderCheckParams = @{
                 GraphApiUrl     = $cloudService.graphApiEndpoint
-                AccessToken     = $Script:Token
                 Endpoint        = "beta"
                 Query           = $Uri
             }
@@ -1287,7 +1286,6 @@ function SearchMailbox {
         $SearchParams = @{
             GraphApiUrl     = $cloudService.graphApiEndpoint
             Query           =  "$($Uri)$UriFilter"
-            AccessToken     = $Script:Token
         }
         
         $SearchItems = Invoke-GraphApiRequest @SearchParams
@@ -1521,7 +1519,6 @@ function GetFolderList{
     $Script:folderList = New-Object System.Collections.ArrayList
     [string]$Query = "users/$($Script:userMailbox)/mailFolders/delta"
     $params = @{
-        AccessToken         = $Script:Token
         GraphApiUrl         = $cloudService.graphApiEndpoint
         Query               = $Query
     }
@@ -1608,7 +1605,6 @@ function GetRecoverableItemsFolderList{
     [string]$Query = "users/$($Script:userMailbox)/mailFolders/RecoverableItemsRoot/childfolders/?includeHiddenFolders=true"
 
     $params = @{
-        AccessToken         = $Script:Token
         GraphApiUrl         = $cloudService.graphApiEndpoint
         Query               = $Query
     }
@@ -1635,7 +1631,6 @@ function GetRecoverableItemsFolderList{
     foreach($folder in $Script:folderList){
         $Query = "users/$($Script:userMailbox)/mailFolders/$($folder.id)/childfolders/?includeHiddenFolders=true"
         $params = @{
-            AccessToken         = $Script:Token
             GraphApiUrl         = $cloudService.graphApiEndpoint
             Query               = $Query
         }
@@ -1721,7 +1716,6 @@ Get-OAuthToken -AppScope $Scope
 #Get the mailbox settings to retrieve the primary and archive mailbox guids for the specified mailbox
 [string]$Query = "users/$Mailbox/settings/exchange"
 $params = @{
-    AccessToken         = $Script:Token
     GraphApiUrl         = $cloudService.graphApiEndpoint
     Query               = $Query
     #Endpoint            = $Endpoint
