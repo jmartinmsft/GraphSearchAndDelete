@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260819.0834
+# Version 20260819.1444
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -114,17 +114,35 @@ param (
 )
 
 #region Logging
+function Initialize-Log {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $Script:LogWriter = [System.IO.StreamWriter]::new($Path, $true, $encoding, 65536)
+    $Script:LogWriter.AutoFlush = $false
+    $Script:LogLinesSinceFlush = 0
+}
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet("INFO","WARN","ERROR","DEBUG")]
+        [ValidateSet("INFO", "WARN", "ERROR", "DEBUG")]
         [string]$Level = "INFO"
     )
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry = "[$timestamp] [$Level] $Message"
-    if ($Script:LogFile) {
-        Add-Content -Path $Script:LogFile -Value $entry
+
+    if ($null -ne $Script:LogWriter) {
+        $Script:LogWriter.WriteLine($entry)
+        $Script:LogLinesSinceFlush++
+
+        # Periodically flush buffered entries; flush errors immediately.
+        if ($Level -eq "ERROR" -or $Script:LogLinesSinceFlush -ge 50) {
+            $Script:LogWriter.Flush()
+            $Script:LogLinesSinceFlush = 0
+        }
     }
+
     switch ($Level) {
         "ERROR" { Write-Host $entry -ForegroundColor Red }
         "WARN"  { Write-Host $entry -ForegroundColor Yellow }
@@ -133,13 +151,22 @@ function Write-Log {
     }
 }
 
+function Close-Log {
+    if ($null -ne $Script:LogWriter) {
+        $Script:LogWriter.Flush()
+        $Script:LogWriter.Dispose()
+        $Script:LogWriter = $null
+    }
+}
+
 # Initialize log file
 
-    if (-not([string]::IsNullOrEmpty($OutputPath))) {
-        $Script:LogFile = Join-Path $OutputPath "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    } else {
-        $Script:LogFile = Join-Path $PSScriptRoot "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    }
+if (-not([string]::IsNullOrEmpty($OutputPath))) {
+    $Script:LogFile = Join-Path $OutputPath "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+} else {
+    $Script:LogFile = Join-Path $PSScriptRoot "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+}
+Initialize-Log -Path $Script:LogFile
 
 Write-Log "Script started. Mailbox: $Mailbox | Archive: $Archive | SearchDumpster: $SearchDumpster | PermissionType: $PermissionType"
 Write-Log "Output path: $OutputPath | Log file: $Script:LogFile"
@@ -780,10 +807,6 @@ function Invoke-GraphApiRequest {
         [Parameter(Mandatory = $false)]
         [string]$Body,
 
-        [Parameter(Mandatory = $true)]
-        [ValidatePattern("^([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_\-\+\/=]*)")]
-        [string]$AccessToken,
-
         [Parameter(Mandatory = $false)]
         [int]$ExpectedStatusCode = 200,
 
@@ -822,7 +845,7 @@ function Invoke-GraphApiRequest {
             Write-Log "Body: $Body" -Level DEBUG
             $graphApiRequestParams.Add("Body", $Body)
         }
-        if($PSVersionTable.PSVersion.Major -eq 7){
+        if($PSVersionTable.PSVersion.Major -ge 7){
             #Need to prevent redirection as it will fail without sending Auth header again. This is a known issue with PS7 and Invoke-WebRequest.
             Write-Log "PSVersion is 7 or higher, setting MaximumRedirection to 0" -Level DEBUG
             $graphApiRequestParams.Add("MaximumRedirection", 0)
@@ -901,6 +924,7 @@ function Invoke-WebRequestWithProxyDetection {
         catch {
             $response = $_
             $httpResponse = $response.Exception.Response
+            $responseBody = $_.ErrorDetails.Message
             $statusCode = if ($null -ne $httpResponse) {
                 [int]$httpResponse.StatusCode
             }
@@ -911,7 +935,6 @@ function Invoke-WebRequestWithProxyDetection {
             if($statusCode -ne 429){
                 if($statusCode -eq 308){
                     Write-Log $response.Exception.Message -Level DEBUG
-                    $Global:redirectResponse = $response
                     $responseType = $httpResponse.GetType().FullName
                     #Get the aux archive location from the response headers. The location header is different for PS7 and PS5 so we need to check the type of the response object.
                     $location = if ($responseType -eq 'System.Net.Http.HttpResponseMessage') {
@@ -928,16 +951,27 @@ function Invoke-WebRequestWithProxyDetection {
                             Successful = $false
                     }
                 }
+                if($statusCode -ge 500 -and $statusCode -lt 600){
+                    Write-Log "Graph API request failed with status code: $statusCode - $($httpResponse.StatusDescription)" -Level ERROR
+                    return [PSCustomObject]@{
+                        ErrorCode    = $httpResponse.StatusDescription
+                        ErrorMessage = $response.Exception.Message
+                        StatusCode = [int]$httpResponse.StatusCode
+                        Successful = $false
+                    }
+                }
                 else{
                     #Error encountered, read the response body to get the error message and return it to the caller.
-                    $reader = [System.IO.StreamReader]::New($httpResponse.GetResponseStream())
-                    try {
-                        $body = $reader.ReadToEnd()
-                        $responseContent = $body | ConvertFrom-Json
+                    if ([string]::IsNullOrWhiteSpace($responseBody) -and $null -ne $httpResponse -and $httpResponse.PSObject.Methods.Name -contains 'GetResponseStream') {
+                        $reader = [System.IO.StreamReader]::New($httpResponse.GetResponseStream())
+                        try {
+                            $responseBody = $reader.ReadToEnd()
+                        }
+                        finally {
+                            $reader.Dispose()
+                        }
                     }
-                    finally {
-                        $reader.Dispose()
-                    }
+                    $responseContent = $responseBody | ConvertFrom-Json
                     Write-Log "Graph API request failed with status code: $statusCode" -Level DEBUG
                     Write-Log "Error message: $($responseContent.error.message)" -Level DEBUG
                     return [PSCustomObject]@{
@@ -1059,7 +1093,7 @@ function Get-OAuthToken {
     
             if ($null -eq $jwt) {
                 Write-Log "Unable to generate Json Web Token by using certificate: $CertificateThumbprint" -Level ERROR
-                exit
+                exit 1
             }
     
             $Script:applicationInfo.Add("AppSecret", $jwt)
@@ -1081,7 +1115,7 @@ function Get-OAuthToken {
             Write-Host ""
             Write-Log "Unable to fetch an OAuth token. Please review the error message below and re-run the script:" -Level ERROR
             Write-Log $oAuthReturnObject.ExceptionMessage -Level ERROR
-            exit
+            exit 1
         }
         $Script:Token = $oAuthReturnObject.OAuthToken.access_token
         $Script:tokenLastRefreshTime = $oAuthReturnObject.LastTokenRefreshTime
@@ -1110,37 +1144,93 @@ function Get-OAuthToken {
     }    
 }
 
-function Check-FilterResults{
+function ConvertTo-SearchResult{
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [object]$Result
+        [Parameter(Mandatory)]
+        [object]$Result,
+
+        [Parameter(Mandatory)]
+        [string]$MailboxName,
+
+        [Parameter(Mandatory)]
+        [string]$FolderPath
     )
+    
     #Check if attachment name is specified
-    if(-not([string]::IsNullOrEmpty($AttachmentName))){
-        $attachmentFound = $false
-        foreach($attachment in $Result.Attachments){
-            if($attachment.name -eq $AttachmentName){
-                $attachmentFound = $true
+    $matchedAttachment = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($AttachmentName)) {
+        foreach ($attachment in @($Result.attachments)) {
+            if ([string]::Equals(
+                [string]$attachment.name,
+                $AttachmentName,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                $matchedAttachment = [string]$attachment.name
                 break
             }
         }
-    }
-    
-    #Check if message body is specified
-    if(-not([string]::IsNullOrEmpty($MessageBody))){
-        $bodyFound = $false
-        if(-not([string]::IsNullOrEmpty($Result.body.content)) -and $Result.body.content.IndexOf($MessageBody, [StringComparison]::OrdinalIgnoreCase) -ge 0){
-            $bodyFound = $true
+
+        if ($null -eq $matchedAttachment) {
+            return $null
         }
     }
-    
-    #Add result to search results
-    if((-not([string]::IsNullOrEmpty($AttachmentName)) -and $attachmentFound) -and (([string]::IsNullOrEmpty($MessageBody)) -or $bodyFound)){
-        $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address;attachment=$attachment.Name}) | Out-Null
+
+    #Check if message body is specified
+    if (-not [string]::IsNullOrWhiteSpace($MessageBody)) {
+        $bodyContent = [string]$Result.body.content
+
+        if ([string]::IsNullOrEmpty($bodyContent) -or $bodyContent.IndexOf($MessageBody, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            return $null
+        }
     }
-    elseif(([string]::IsNullOrEmpty($AttachmentName) -or $attachmentFound) -and (-not([string]::IsNullOrEmpty($MessageBody)) -and $bodyFound)){
-        $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+    $senderAddress = $null
+    if ($null -ne $Result.from -and $null -ne $Result.from.emailAddress) {
+        $senderAddress = [string]$Result.from.emailAddress.address
     }
+
+    [PSCustomObject][ordered]@{
+        mailbox          = $MailboxName
+        id               = [string]$Result.id
+        folder           = $FolderPath
+        internetMessageId = [string]$Result.internetMessageId
+        subject          = [string]$Result.subject
+        receivedDateTime = [string]$Result.receivedDateTime
+        from             = $senderAddress
+        attachment       = $matchedAttachment
+    }
+}
+
+function ConvertTo-DeleteResult{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object]$Response,
+        [Parameter(Mandatory)]
+        [object]$currentBatch
+    )
+    #Create object with item information
+    $item = [PSCustomObject]@{
+        Mailbox=$currentBatch[[int]$Response.id].mailbox
+        Id=$currentBatch[[int]$Response.id].id
+        Folder=$currentBatch[[int]$Response.id].folder
+        Subject=$currentBatch[[int]$Response.id].subject
+        ReceivedDateTime=$currentBatch[[int]$Response.id].receivedDateTime
+        From=$currentBatch[[int]$Response.id].from
+        Attachment=$currentBatch[[int]$Response.id].attachment
+    }
+    #Add the delete status to the object based on the response from Graph API
+    if($Response.Status -ne 204){
+        Write-Log $Response.Body.Error.Message -Level WARN
+        $Script:itemsFailedDelete++
+        $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Failed"
+    }
+    else{
+        $Script:itemsDeleted++
+        $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Succeeded"
+    }
+    return $item
 }
 function SearchMailbox {
     param(
@@ -1148,7 +1238,7 @@ function SearchMailbox {
     )
     Write-Log "Performing search against the mailbox..." -Level INFO
     #Array to hold the search results for all folders
-    $Script:SearchResults = New-Object System.Collections.ArrayList
+    [int64]$Script:TotalSearchResults = 0
     #Perform the search against each folder
     foreach($MailboxFolder in $Script:searchFolders) {
         #Array to hold the search results for the current folder to be used for deletion if the delete switch is set
@@ -1199,7 +1289,7 @@ function SearchMailbox {
             Query           =  "$($Uri)$UriFilter"
             AccessToken     = $Script:Token
         }
-
+        
         $SearchItems = Invoke-GraphApiRequest @SearchParams
         #Check for errors in the search request and log them if found, then continue to the next folder
         if($SearchItems.Successful -eq $false){
@@ -1209,17 +1299,22 @@ function SearchMailbox {
             continue
         }
         else{
+            $pageResults = [System.Collections.Generic.List[object]]::new()
             foreach($Result in $SearchItems.Content.Value){
-                if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
-                    Check-FilterResults -Result $Result
-                }
-                else{
-                    $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
+                $item = ConvertTo-SearchResult -Result $Result -MailboxName $mailboxName -FolderPath $MailboxFolder.displayName
+                if($null -ne $item){
+                    $Script:folderSearchResults.Add($item) | Out-Null
+                    $pageResults.Add($item)
+                    $Script:TotalSearchResults++
                 }
             }
+            if ($pageResults.Count -gt 0) {
+                $pageResults | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+            }
             while($null -ne $SearchItems.Content.'@odata.nextLink'){
+                $pageResults = [System.Collections.Generic.List[object]]::new()
                 $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
-                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
                 if($SearchItems.Successful -eq $false){
                     Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
                     Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
@@ -1228,12 +1323,15 @@ function SearchMailbox {
                 }
                 else{
                     foreach($Result in $SearchItems.Content.Value){
-                        if(-not[string]::IsNullOrEmpty($AttachmentName) -or -not[string]::IsNullOrEmpty($MessageBody)){
-                            Check-FilterResults -Result $Result
+                        $item = ConvertTo-SearchResult -Result $Result -MailboxName $mailboxName -FolderPath $MailboxFolder.displayName
+                        if($null -ne $item){
+                            $Script:folderSearchResults.Add($item) | Out-Null
+                            $pageResults.Add($item)
+                            $Script:TotalSearchResults++
                         }
-                        else{
-                            $Script:folderSearchResults.Add([PSCustomObject]@{mailbox=$mailboxName;id=$Result.id; folder=$MailboxFolder.displayName.Split('\')[-1]; internetMessageId=$Result.internetMessageId;subject=$Result.subject;receivedDateTime=$Result.receivedDateTime;from=$Result.from.emailaddress.address}) | Out-Null
-                        }
+                    }
+                    if ($pageResults.Count -gt 0) {
+                        $pageResults | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
                     }
                 }
             }
@@ -1242,9 +1340,7 @@ function SearchMailbox {
         if($searchFailures -gt 0){
             Write-Log ([string]::Format("Search for {0} folder in mailbox {1} had {2} failures.", $MailboxFolder.displayName, $mailboxName, $searchFailures)) -Level WARN
         }
-        #Add the folder results to the total list of results
-        $Script:SearchResults.AddRange($Script:folderSearchResults)
-
+        
         #Delete items now to ensure correct mailbox using batches
         if($DeleteContent -and $Script:folderSearchResults.count -gt 0){
             if($searchFailures -gt 0){
@@ -1270,8 +1366,8 @@ function SearchMailbox {
                 #User has confirmed to continue with the delete, so proceed with the delete operation and don't prompt again
                 $ConfirmDelete = $false
                 Write-Log "Deleting $($Script:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
-                [int]$itemsDeleted = 0
-                [int]$itemsFailedDelete = 0
+                [int]$Script:itemsDeleted = 0
+                [int]$Script:itemsFailedDelete = 0
                 [int]$itemsProcessed = 0
                 #prevent batch size being reduced from previous folder search results
                 $currentBatchSize = $BatchSize
@@ -1288,6 +1384,9 @@ function SearchMailbox {
                     }
                     #Create an array of requests to send to the batch endpoint
                     $requests = New-Object System.Collections.ArrayList
+                    #Create a hash table to track delete status for each item in the batch.
+                    $itemIdLookup = @{}
+
                     for($x=0; $x -lt $currentBatchSize; $x++){
                         if($HardDelete){
                             $Method = "POST"
@@ -1297,11 +1396,13 @@ function SearchMailbox {
                             $Method = "DELETE"
                             $Url = "/users/MBX:$($mailboxName)/messages/$($Script:folderSearchResults[$itemsProcessed].id)"
                         }
+
                         $request = @{
                             Id          = $x+1
                             Method      = $Method
                             Url         = $Url
                         }
+                        $itemIdLookup[($x+1)] = $Script:folderSearchResults[$itemsProcessed]
                         $requests.Add($request) | Out-Null
                         $itemsProcessed++
                     }
@@ -1310,30 +1411,45 @@ function SearchMailbox {
                     } | ConvertTo-Json -Depth 6
 
                     Write-Log "Sending batch delete request ($currentBatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
-                    $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -AccessToken $Script:Token -Method POST -Body $batchRequest
+                    $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -Method POST -Body $batchRequest
+        
                     #Check the responses from the batch for any failures
                     if($batchDeleteResponse.Successful -eq $false){
                         Write-Log "Batch request to delete items failed." -Level WARN
                         Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
-                        $itemsFailedDelete = $itemsFailedDelete + $currentBatchSize
-                    }
-                    else{
-                        #Check the response for each delete request
-                        foreach($response in $batchDeleteResponse.Content.Responses){
-                            if($response.status -ne 204){
-                                Write-Log $response.Body.Error.Message -Level WARN
-                                $itemsFailedDelete++
-                            }
-                            else{
-                                $itemsDeleted++
+                        $Script:itemsFailedDelete = $Script:itemsFailedDelete + $currentBatchSize
+                        #Entire batch failed, so log all items in the batch as failed to delete
+                        $deleteFailed = foreach($entry in $itemIdLookup.GetEnumerator()) { 
+                            [PSCustomObject]@{ 
+                                Mailbox=$entry.value.mailbox
+                                Id=$entry.value.id
+                                Folder=$entry.value.folder
+                                Subject=$entry.value.subject
+                                ReceivedDateTime=$entry.value.receivedDateTime
+                                From=$entry.value.from
+                                Attachment=$entry.value.attachment
+                                DeleteStatus='Failed'
                             }
                         }
+                        $deleteFailed | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                    }
+                    else{
+                        $deleteResults = [System.Collections.Generic.List[object]]::new()
+                        #Check the response for each delete request
+                        foreach($response in $batchDeleteResponse.Content.Responses){
+                            $result = ConvertTo-DeleteResult -Response $response -currentBatch $itemIdLookup
+                            $deleteResults.Add($result)
+                        }
+                        $deleteResults | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                        Write-Log (
+                            "Batch delete completed: {0} responses, {1} succeeded, {2} failed." -f
+                                $deleteResults.Count,
+                                @($deleteResults.Where({ $_.DeleteStatus -eq "Succeeded" })).Count,
+                                @($deleteResults.Where({ $_.DeleteStatus -eq "Failed" })).Count
+                        ) -Level DEBUG
                     }
                 }
-                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsDeleted items processed." -Level INFO
-                if($itemsFailedDelete -gt 0){
-                    Write-Log "Delete failed for $itemsFailedDelete items in $($MailboxFolder.displayName) folder." -Level WARN
-                }
+                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsProcessed processed; $Script:itemsDeleted succeeded; $Script:itemsFailedDelete failed." -Level INFO
             }
         }
     }   
@@ -1414,14 +1530,14 @@ function GetFolderList{
     if($Script:FolderResults.Successful -eq $false){
         Write-Log "Unable to get a list of folders in the mailbox. Please review the error message below and re-run the script:" -Level ERROR
         Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
-        exit
+        exit 0
     }
     foreach($Result in $Script:FolderResults.Content.Value){
         $Script:folderList.Add($Result) | Out-Null
     }   
     while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
         $Query = $Script:FolderResults.Content.'@odata.nextLink'.Substring($Script:FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
-        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
         foreach($Result in $Script:FolderResults.Content.Value){
             $Script:folderList.Add($Result) | Out-Null
         }
@@ -1501,14 +1617,14 @@ function GetRecoverableItemsFolderList{
     if($Script:FolderResults.Successful -eq $false){
         Write-Log "Unable to get a list of folders in the recoverable items. Please review the error message below and re-run the script:" -Level ERROR
         Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
-        exit
+        exit 1
     }
     foreach($Result in $Script:FolderResults.Content.Value){
         $Script:folderList.Add($Result) | Out-Null
     }    
     while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
         $Query = $Script:FolderResults.Content.'@odata.nextLink'.Substring($Script:FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
-        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
         foreach($Result in $Script:FolderResults.Content.Value){
             $Script:folderList.Add($Result) | Out-Null
         }
@@ -1530,7 +1646,7 @@ function GetRecoverableItemsFolderList{
         }    
         while($null -ne $FolderResults.Content.'@odata.nextLink'){
             $Query = $FolderResults.Content.'@odata.nextLink'.Substring($FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
-            $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -AccessToken $Script:Token -Query $Query
+            $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
             foreach($Result in $FolderResults.Content.Value){
                 $subfolderList.Add($Result) | Out-Null
             }
@@ -1591,7 +1707,7 @@ if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
         }
     }
 }
-
+try{
 #Get parameters and pass to obtain an OAuth token
 $cloudService = Get-CloudServiceEndpoint $AzureEnvironment
 $azureADEndpoint = $cloudService.AzureADEndpoint
@@ -1615,7 +1731,7 @@ $Script:MailboxSettings = Invoke-GraphApiRequest @params
 if($MailboxSettings.Successful -eq $false){
     Write-Log "Unable to retrieve mailbox settings for $Mailbox. Please check the mailbox name and try again." -Level ERROR
     Write-Log "Error details: $($MailboxSettings.ErrorMessage)" -Level ERROR
-    exit
+    exit 1
 }
 #Capture the primary and archive mailbox guids for use in the search
 $Script:archiveMailbox = $MailboxSettings.Content.inPlaceArchiveMailboxId
@@ -1729,11 +1845,18 @@ $Script:searchFolders | Format-Table displayName
 #Create csv file to hold the search results
 $Script:searchResultsCsvPath = "$($OutputPath)\SearchResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
 Write-Log "Search results will be saved to: $($Script:searchResultsCsvPath)" -Level INFO
+if($DeleteContent){
+    $Script:deleteResultsCsvPath = "$($OutputPath)\DeleteResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    Write-Log "Delete results will be saved to: $($Script:deleteResultsCsvPath)" -Level INFO
+}
 #Initiate the search against the mailbox using the specified query and parameters
 SearchMailbox -uriQuery "/users/$Script:userMailbox/mailFolders"
 
-Write-Log ([string]::Format("Search complete. {0} item(s) found in total.", $Script:SearchResults.Count)) -Level INFO
+Write-Log "Search complete. $Script:TotalSearchResults item(s) found in total." -Level INFO
 #Export the search results to a CSV file
-$Script:SearchResults | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append
 Write-Log "Results exported to: $($Script:searchResultsCsvPath)" -Level INFO
 Write-Log "Script completed. Log file: $($Script:LogFile)" -Level INFO
+}
+finally{
+    Close-Log
+}
