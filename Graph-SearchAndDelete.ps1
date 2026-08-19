@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260819.1444
+# Version 20260819.1912
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -388,7 +388,19 @@ function Get-ApplicationAccessToken {
             $body.Add("client_assertion", $Secret)
         } else {
             Write-Log "Authentication is based on a secret" -Level DEBUG
-            $body.Add("client_secret", $Secret)
+            $bstr = [IntPtr]::Zero
+            $plainSecret = $null
+            try {
+                $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($OAuthClientSecret)
+                $plainSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+                $body.client_secret = $plainSecret
+            }
+            finally{
+                $plainSecret = $null
+                if ($bstr -ne [IntPtr]::Zero) {
+                    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                }
+            }
         }
 
         $invokeRestMethodParams = @{
@@ -408,6 +420,11 @@ function Get-ApplicationAccessToken {
             Write-Log "We fail to create an OAuth token - Exception: $($_.Exception.Message)" -Level ERROR
             $exceptionMessage = $_.Exception.Message
         }
+        
+        finally{
+            $body.Remove("client_secret")
+        }
+        #>
     }
     end {
         return [PSCustomObject]@{
@@ -810,8 +827,11 @@ function Invoke-GraphApiRequest {
         [Parameter(Mandatory = $false)]
         [int]$ExpectedStatusCode = 200,
 
-        [Parameter(Mandatory = $true)]
-        [string]$GraphApiUrl
+        [Parameter(Mandatory = $false)]
+        [string]$GraphApiUrl,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Headers = @{}
     )
 
     <#
@@ -832,9 +852,25 @@ function Invoke-GraphApiRequest {
         #Check for expired token before making Graph request
         Update-AccessTokenIfNeeded
 
+        $requestUri = if ([Uri]::IsWellFormedUriString($Query, [UriKind]::Absolute)) {
+           $Query
+        }
+        else {
+            "$GraphApiUrl/$Endpoint/$($Query.TrimStart('/'))"
+        }
+
+        $requestHeaders = @{
+            Authorization = "Bearer $Script:Token"
+        }
+        foreach ($name in $Headers.Keys) {
+           $requestHeaders[$name] = $Headers[$name]
+        }
+
         $graphApiRequestParams = @{
-            Uri             = "$GraphApiUrl/$Endpoint/$($Query.TrimStart("/"))"
-            Header          = @{ Authorization = "Bearer $Script:Token" }
+            #Uri             = "$GraphApiUrl/$Endpoint/$($Query.TrimStart("/"))"
+            Uri             = $requestUri
+            #Header          = @{ Authorization = "Bearer $Script:Token" }
+            Header          = $requestHeaders
             Method          = $Method
             ContentType     = $ContentType
             UseBasicParsing = $true
@@ -1077,9 +1113,7 @@ function Get-OAuthToken {
     if($PermissionType -eq "Application") {
         $Script:GraphScope = "$($Script:GraphScope).default"
         if ([System.String]::IsNullOrEmpty($OAuthCertificate)) {
-            $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($OAuthClientSecret)
-            $Secret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-            $Script:applicationInfo.Add("AppSecret", $Secret)
+            $Script:applicationInfo.Add("AppSecret", $OAuthClientSecret)
         }
         else {
             $jwtParams = @{
@@ -1219,8 +1253,10 @@ function ConvertTo-DeleteResult{
         ReceivedDateTime=$currentBatch[[int]$Response.id].receivedDateTime
         From=$currentBatch[[int]$Response.id].from
         Attachment=$currentBatch[[int]$Response.id].attachment
+        StatusCode=[int]$Response.Status
     }
     #Add the delete status to the object based on the response from Graph API
+    <#
     if($Response.Status -ne 204){
         Write-Log $Response.Body.Error.Message -Level WARN
         $Script:itemsFailedDelete++
@@ -1230,6 +1266,25 @@ function ConvertTo-DeleteResult{
         $Script:itemsDeleted++
         $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Succeeded"
     }
+    #>
+    switch($Response.Status){
+        204 {
+            $Script:itemsDeleted++
+            $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Succeeded"
+        }
+        429 {
+            Write-Log "Too many requests. Retrying deletion later." -Level WARN
+            $Script:itemsRetry++
+            $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Retry"
+        }
+        default {
+            Write-Log "Failed to delete item. Status code: $($Response.Status)" -Level WARN
+            $Script:itemsFailedDelete++
+            $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Failed"
+        }
+    }
+    
+
     return $item
 }
 function SearchMailbox {
@@ -1286,6 +1341,7 @@ function SearchMailbox {
         $SearchParams = @{
             GraphApiUrl     = $cloudService.graphApiEndpoint
             Query           =  "$($Uri)$UriFilter"
+            #Headers     = @{ Prefer = 'IdType="ImmutableId"' }
         }
         
         $SearchItems = Invoke-GraphApiRequest @SearchParams
@@ -1311,8 +1367,8 @@ function SearchMailbox {
             }
             while($null -ne $SearchItems.Content.'@odata.nextLink'){
                 $pageResults = [System.Collections.Generic.List[object]]::new()
-                $Query = $SearchItems.Content.'@odata.nextLink'.Substring($SearchItems.Content.'@odata.nextLink'.IndexOf("user"))
-                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
+                $Query = [string]$SearchItems.Content.'@odata.nextLink'
+                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query #-Headers @{ Prefer = 'IdType="ImmutableId"' }
                 if($SearchItems.Successful -eq $false){
                     Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
                     Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
@@ -1357,15 +1413,19 @@ function SearchMailbox {
             elseif($ConfirmDelete){ 
                 $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
                 $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
-                $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
-                $confirmation = $host.ui.PromptForChoice("Confirmation to delete all items found", "Do you want to continue?", $options, 1)
+                $all = New-Object System.Management.Automation.Host.ChoiceDescription "&All"
+                $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no, $all)
+                $confirmation = $host.ui.PromptForChoice("Confirmation to delete all items found in folder", "Do you want to continue?", $options, 1)
+                if($confirmation -eq 2){
+                    $ConfirmDelete = $false
+                }
             }
             if($confirmation -eq 0 -or $ConfirmDelete -eq $false){
                 #User has confirmed to continue with the delete, so proceed with the delete operation and don't prompt again
-                $ConfirmDelete = $false
                 Write-Log "Deleting $($Script:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
                 [int]$Script:itemsDeleted = 0
                 [int]$Script:itemsFailedDelete = 0
+                [int]$Script:itemsRetry = 0
                 [int]$itemsProcessed = 0
                 #prevent batch size being reduced from previous folder search results
                 $currentBatchSize = $BatchSize
@@ -1399,25 +1459,35 @@ function SearchMailbox {
                             Id          = $x+1
                             Method      = $Method
                             Url         = $Url
+                            Headers = @{
+                               Prefer = 'IdType="ImmutableId"'
+                            }
                         }
                         $itemIdLookup[($x+1)] = $Script:folderSearchResults[$itemsProcessed]
                         $requests.Add($request) | Out-Null
                         $itemsProcessed++
                     }
-                    $batchRequest = @{
-                        Requests = $requests
-                    } | ConvertTo-Json -Depth 6
+                    
+                    #Retry logic for batch delete requests. If any of the requests in the batch fail with a 429 (Too Many Requests) status code, we will retry those requests up to 4 times with exponential backoff.
+                    $pendingRequests = @($requests)
+                    $maxAttempts = 4
 
-                    Write-Log "Sending batch delete request ($currentBatchSize items, total deleted so far: $itemsDeleted)" -Level DEBUG
-                    $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -Method POST -Body $batchRequest
+                    for ($attempt = 1; $attempt -le $maxAttempts -and $pendingRequests.Count; $attempt++) {
+                        $batchRequest = @{
+                            Requests = $pendingRequests
+                            #Requests = $requests
+                        } | ConvertTo-Json -Depth 6
+
+                        Write-Log "Sending batch delete request ($($pendingRequests.Count) items, total deleted so far: $itemsDeleted)" -Level DEBUG
+                        $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -Method POST -Body $batchRequest
         
-                    #Check the responses from the batch for any failures
-                    if($batchDeleteResponse.Successful -eq $false){
-                        Write-Log "Batch request to delete items failed." -Level WARN
-                        Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
-                        $Script:itemsFailedDelete = $Script:itemsFailedDelete + $currentBatchSize
-                        #Entire batch failed, so log all items in the batch as failed to delete
-                        $deleteFailed = foreach($entry in $itemIdLookup.GetEnumerator()) { 
+                        #Check the responses from the batch for any failures
+                        if($batchDeleteResponse.Successful -eq $false){
+                            Write-Log "Batch request to delete items failed." -Level WARN
+                            Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
+                            $Script:itemsFailedDelete = $Script:itemsFailedDelete + $currentBatchSize
+                            #Entire batch failed, so log all items in the batch as failed to delete
+                            $deleteFailed = foreach($entry in $itemIdLookup.GetEnumerator()) { 
                             [PSCustomObject]@{ 
                                 Mailbox=$entry.value.mailbox
                                 Id=$entry.value.id
@@ -1428,26 +1498,56 @@ function SearchMailbox {
                                 Attachment=$entry.value.attachment
                                 DeleteStatus='Failed'
                             }
+                            }
+                            $deleteFailed | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
                         }
-                        $deleteFailed | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
-                    }
-                    else{
-                        $deleteResults = [System.Collections.Generic.List[object]]::new()
-                        #Check the response for each delete request
-                        foreach($response in $batchDeleteResponse.Content.Responses){
-                            $result = ConvertTo-DeleteResult -Response $response -currentBatch $itemIdLookup
-                            $deleteResults.Add($result)
+                        else{
+                            #Setup for list of requests to retry if any of the responses return a 429 status code
+                            $retryRequests = [System.Collections.Generic.List[object]]::new()
+                            $retryAfterSeconds = 0
+
+                            $deleteResults = [System.Collections.Generic.List[object]]::new()
+                            #Check the response for each delete request
+                            foreach($response in $batchDeleteResponse.Content.Responses){
+                                $result = ConvertTo-DeleteResult -Response $response -currentBatch $itemIdLookup
+                                if($result.StatusCode -eq 429 -and $attempt -lt $maxAttempts){
+                                    #If the request failed with a 429 status code, add it to the list of requests to retry and determine the delay before retrying based on the Retry-After header in the response.
+                                    $requestToRetry = $pendingRequests |  Where-Object { [string]$_.Id -eq [string]$response.Id } | Select-Object -First 1
+                                    if ($null -ne $requestToRetry) {
+                                        $retryRequests.Add($requestToRetry)
+                                    }
+                                    $delay = 0
+                                    if ([int]::TryParse([string]$response.headers.'Retry-After',[ref]$delay)) {
+                                        $retryAfterSeconds = [Math]::Max($retryAfterSeconds,$delay)
+                                    }
+                                }
+                                else{
+                                    #Request either successful or failed with a status code other than 429, so add it to the delete results to be logged.
+                                    $deleteResults.Add($result)
+                                }
+                            }
+                            $deleteResults | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                            Write-Log (
+                                "Batch delete completed: {0} responses, {1} succeeded, {2} failed, {3} retried." -f
+                                    $deleteResults.Count,
+                                    @($deleteResults.Where({ $_.DeleteStatus -eq "Succeeded" })).Count,
+                                    @($deleteResults.Where({ $_.DeleteStatus -eq "Failed" })).Count,
+                                    @($deleteResults.Where({ $_.DeleteStatus -eq "Retry" })).Count
+                            ) -Level DEBUG
                         }
-                        $deleteResults | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
-                        Write-Log (
-                            "Batch delete completed: {0} responses, {1} succeeded, {2} failed." -f
-                                $deleteResults.Count,
-                                @($deleteResults.Where({ $_.DeleteStatus -eq "Succeeded" })).Count,
-                                @($deleteResults.Where({ $_.DeleteStatus -eq "Failed" })).Count
-                        ) -Level DEBUG
+                        #Update the request list for the batch to only include the requests that need to be retried due to a 429 status code. If there are no requests to retry, the loop will exit.
+                        $pendingRequests = @($retryRequests)
+
+                        #Determine retry delay based on the Retry-After header in the response. If no Retry-After header is present, use exponential backoff based on the attempt number.
+                        if ($pendingRequests.Count -and $attempt -lt $maxAttempts) {
+                            if ($retryAfterSeconds -le 0) {
+                                $retryAfterSeconds = [Math]::Pow(2, $attempt)
+                            }
+                            Start-Sleep -Seconds ($retryAfterSeconds + 1)
+                        }
                     }
                 }
-                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsProcessed processed; $Script:itemsDeleted succeeded; $Script:itemsFailedDelete failed." -Level INFO
+                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsProcessed processed; $Script:itemsDeleted succeeded; ($Script:itemsFailedDelete + $Script:itemsRetried) failed; " -Level INFO
             }
         }
     }   
@@ -1527,13 +1627,13 @@ function GetFolderList{
     if($Script:FolderResults.Successful -eq $false){
         Write-Log "Unable to get a list of folders in the mailbox. Please review the error message below and re-run the script:" -Level ERROR
         Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
-        exit 0
+        exit 1
     }
     foreach($Result in $Script:FolderResults.Content.Value){
         $Script:folderList.Add($Result) | Out-Null
     }   
     while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
-        $Query = $Script:FolderResults.Content.'@odata.nextLink'.Substring($Script:FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+        $Query = [string]$Script:FolderResults.Content.'@odata.nextLink'
         $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
         foreach($Result in $Script:FolderResults.Content.Value){
             $Script:folderList.Add($Result) | Out-Null
@@ -1619,7 +1719,7 @@ function GetRecoverableItemsFolderList{
         $Script:folderList.Add($Result) | Out-Null
     }    
     while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
-        $Query = $Script:FolderResults.Content.'@odata.nextLink'.Substring($Script:FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+        $Query = [string]$Script:FolderResults.Content.'@odata.nextLink'
         $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
         foreach($Result in $Script:FolderResults.Content.Value){
             $Script:folderList.Add($Result) | Out-Null
@@ -1640,7 +1740,7 @@ function GetRecoverableItemsFolderList{
             $subfolderList.Add($Result) | Out-Null
         }    
         while($null -ne $FolderResults.Content.'@odata.nextLink'){
-            $Query = $FolderResults.Content.'@odata.nextLink'.Substring($FolderResults.Content.'@odata.nextLink'.IndexOf("user"))
+            $Query = [string]$FolderResults.Content.'@odata.nextLink'
             $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
             foreach($Result in $FolderResults.Content.Value){
                 $subfolderList.Add($Result) | Out-Null
@@ -1657,8 +1757,15 @@ function GetRecoverableItemsFolderList{
 #Safety check to ensure the search is not against the entire mailbox and ConfirmDelete is set to false which would result in all items being deleted from the mailbox
 if((([string]::IsNullOrEmpty($IncludeFolderList)) -and ([string]::IsNullOrEmpty($ExcludeFolderList)) -and $ConfirmDelete -eq $false) -and $DeleteContent){
     Write-Log "Both IncludeFolderList and ExcludeFolderList are not specified and ConfirmDelete is set to false. This could result in all items being deleted from the mailbox. Please review the parameters and try again." -Level ERROR
-    exit
+    exit 0
 }
+
+#Peformance check to ensure MessageBody filter is no the only filter specified since this will result in a full mailbox search and could take a long time to complete
+if(([string]::IsNullOrWhiteSpace($Subject) -and [string]::IsNullOrEmpty($ReceivedBefore) -and [string]::IsNullOrEmpty($ReceivedAfter) -and [string]::IsNullOrEmpty($Sender) -and [string]::IsNullOrWhiteSpace($AttachmentName)) -and (-not [string]::IsNullOrWhiteSpace($MessageBody))){
+    Write-Log "MessageBody is the only filter specified. This will result in a full mailbox search and could take a long time to complete. Please review the parameters and try again." -Level WARN
+    exit 0
+}
+
 #Safety check for an unfiltered search and delete
 if([string]::IsNullOrWhiteSpace($Subject) -and [string]::IsNullOrEmpty($ReceivedBefore) -and [string]::IsNullOrEmpty($ReceivedAfter) -and [string]::IsNullOrEmpty($Sender) -and [string]::IsNullOrWhiteSpace($AttachmentName) -and $DeleteContent){
     Write-Log "No search filters specified and DeleteContent is set to true. This could result in all items being deleted from the mailbox. Please review the parameters and try again." -Level WARN
@@ -1669,7 +1776,7 @@ if([string]::IsNullOrWhiteSpace($Subject) -and [string]::IsNullOrEmpty($Received
     #Confirm with the user that they want to continue with the search since all content in folders will be deleted
     if($confirmation -ne 0){
         Write-Log "Search cancelled by user." -Level WARN
-        exit
+        exit 0
     }
 }
 
@@ -1718,7 +1825,7 @@ Get-OAuthToken -AppScope $Scope
 $params = @{
     GraphApiUrl         = $cloudService.graphApiEndpoint
     Query               = $Query
-    #Endpoint            = $Endpoint
+    Endpoint            = 'beta'
 }
 $Script:MailboxSettings = Invoke-GraphApiRequest @params
 #Check for errors in the mailbox settings request and log them if found, then exit the script
