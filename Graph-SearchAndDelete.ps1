@@ -22,7 +22,7 @@
     SOFTWARE
 #>
 
-# Version 20260819.1912
+# Version 20260820.1426
 
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
@@ -160,12 +160,9 @@ function Close-Log {
 }
 
 # Initialize log file
+$Script:RunId = "{0}_{1}_{2}" -f (Get-Date -Format "yyyyMMdd_HHmmss_fff"), $PID, ([guid]::NewGuid().ToString("N").Substring(0, 8))
+$Script:LogFile = Join-Path $OutputPath "GraphSearch_$($Script:RunId).log"
 
-if (-not([string]::IsNullOrEmpty($OutputPath))) {
-    $Script:LogFile = Join-Path $OutputPath "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-} else {
-    $Script:LogFile = Join-Path $PSScriptRoot "GraphSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-}
 Initialize-Log -Path $Script:LogFile
 
 Write-Log "Script started. Mailbox: $Mailbox | Archive: $Archive | SearchDumpster: $SearchDumpster | PermissionType: $PermissionType"
@@ -1242,7 +1239,8 @@ function ConvertTo-DeleteResult{
         [Parameter(Mandatory)]
         [object]$Response,
         [Parameter(Mandatory)]
-        [object]$currentBatch
+        [object]$currentBatch,[Parameter(Mandatory)]
+        [bool]$IsFinalAttempt
     )
     #Create object with item information
     $item = [PSCustomObject]@{
@@ -1256,30 +1254,30 @@ function ConvertTo-DeleteResult{
         StatusCode=[int]$Response.Status
     }
     #Add the delete status to the object based on the response from Graph API
-    <#
-    if($Response.Status -ne 204){
-        Write-Log $Response.Body.Error.Message -Level WARN
-        $Script:itemsFailedDelete++
-        $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Failed"
-    }
-    else{
-        $Script:itemsDeleted++
-        $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Succeeded"
-    }
-    #>
     switch($Response.Status){
         204 {
             $Script:itemsDeleted++
+            $Script:TotalItemsDeleted++
             $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Succeeded"
         }
         429 {
-            Write-Log "Too many requests. Retrying deletion later." -Level WARN
-            $Script:itemsRetry++
-            $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Retry"
+            if ($IsFinalAttempt) {
+                Write-Log "Deletion remained throttled after the final attempt." -Level WARN
+                $Script:itemsFailedDelete++
+                $Script:TotalDeleteFailures++
+                [void]$Script:DeleteFailureFolders.Add([string]$MailboxFolder.displayName)
+                $item | Add-Member DeleteStatus "Failed"
+            }
+            else {
+                Write-Log "Too many requests. Retrying deletion later." -Level WARN
+                $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Retry"
+            }
         }
         default {
             Write-Log "Failed to delete item. Status code: $($Response.Status)" -Level WARN
             $Script:itemsFailedDelete++
+            $Script:TotalDeleteFailures++
+            [void]$Script:DeleteFailureFolders.Add([string]$MailboxFolder.displayName)
             $item | Add-Member -MemberType NoteProperty -Name "DeleteStatus" -Value "Failed"
         }
     }
@@ -1287,17 +1285,59 @@ function ConvertTo-DeleteResult{
 
     return $item
 }
+
+function Protect-CsvValue {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = [string]$Value
+
+    # Keep each record on one physical CSV line.
+    $text = $text -replace "[`r`n]", " "
+
+    # Force potentially executable spreadsheet values to text.
+    if ($text -match '^[\t ]*[=+\-@]') {
+        return "'$text"
+    }
+
+    return $text
+}
+
+function ConvertTo-SafeCsvRecord {
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object]$InputObject
+    )
+
+    process {
+        $record = [ordered]@{}
+
+        foreach ($property in $InputObject.PSObject.Properties) {
+            if ($property.Value -is [string]) {
+                $record[$property.Name] = Protect-CsvValue $property.Value
+            }
+            else {
+                $record[$property.Name] = $property.Value
+            }
+        }
+
+        [PSCustomObject]$record
+    }
+}
 function SearchMailbox {
     param(
         [string]$uriQuery
     )
     Write-Log "Performing search against the mailbox..." -Level INFO
-    #Array to hold the search results for all folders
+    $Script:IncompleteSearchFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     [int64]$Script:TotalSearchResults = 0
     #Perform the search against each folder
     foreach($MailboxFolder in $Script:searchFolders) {
         #Array to hold the search results for the current folder to be used for deletion if the delete switch is set
-        $Script:folderSearchResults = New-Object System.Collections.ArrayList
+        $Script:folderSearchResults = [System.Collections.Generic.List[object]]::new()
         Write-Log "Searching folder: $($MailboxFolder.displayName)" -Level INFO
         Write-Log "Processing folder: $($MailboxFolder.id)" -level DEBUG
         [int]$searchFailures=0
@@ -1315,12 +1355,26 @@ function SearchMailbox {
             if($Script:FolderCheck.StatusCode -eq 308){
                 Write-Log $Script:FolderCheck.Response.ErrorMessage -Level DEBUG
                 #Modify the URL using the aux archive guid and the folder id for the folder within the aux archive mailbox
-                $mailboxGuid = $FolderCheck.Response.ErrorMessage -match 'MBX:([a-f0-9\-]+)@' | ForEach-Object { $matches[1] }
-                $folderValue = $FolderCheck.Response.ErrorMessage -match "folders\('([^']+)'\)" | ForEach-Object { $matches[1] }
+                $redirect = [string]$Script:FolderCheck.Response.ErrorMessage
+                if ($redirect -notmatch 'MBX:([a-fA-F0-9-]{36})@') {
+                    throw "Unable to extract auxiliary archive mailbox ID from redirect."
+                }
+                $mailboxGuid = $Matches[1]
+
+                if ($redirect -notmatch "folders\('([^']+)'\)") {
+                    throw "Unable to extract auxiliary archive folder ID from redirect."
+                }
+                $folderValue = $Matches[1]
+
+                $parsedGuid = [guid]::Empty
+                if (-not [guid]::TryParse($mailboxGuid, [ref]$parsedGuid)) {
+                    throw "Invalid auxiliary archive mailbox ID."
+                }
+                $mailboxTarget = "MBX:$mailboxGuid@$OAuthTenantId"
                 Write-Log "Checking auxiliary archive mailbox $($mailboxGuid) for items in $($MailboxFolder.displayName)" -Level INFO
-                $auxUriQuery = "/users/MBX:$($mailboxGuid)@$($OAuthTenantId)/mailFolders/$($folderValue)"
+                $auxUriQuery = "/users/$($mailboxTarget)/mailFolders/$($folderValue)"
                 $Uri = "$($auxUriQuery)/messages?"
-                $mailboxName = $mailboxGuid
+                $mailboxName = "$mailboxGuid@$OAuthTenantId"
             }
             else {
                 $mailboxName = $Script:userMailbox.Substring(4)
@@ -1341,7 +1395,7 @@ function SearchMailbox {
         $SearchParams = @{
             GraphApiUrl     = $cloudService.graphApiEndpoint
             Query           =  "$($Uri)$UriFilter"
-            #Headers     = @{ Prefer = 'IdType="ImmutableId"' }
+            Headers     = @{ Prefer = 'IdType="ImmutableId"' }
         }
         
         $SearchItems = Invoke-GraphApiRequest @SearchParams
@@ -1349,6 +1403,7 @@ function SearchMailbox {
         if($SearchItems.Successful -eq $false){
             Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
             Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
+            [void]$Script:IncompleteSearchFolders.Add([string]$MailboxFolder.displayName)
             $searchFailures++
             continue
         }
@@ -1363,16 +1418,17 @@ function SearchMailbox {
                 }
             }
             if ($pageResults.Count -gt 0) {
-                $pageResults | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                $pageResults | ConvertTo-SafeCsvRecord | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
             }
             while($null -ne $SearchItems.Content.'@odata.nextLink'){
                 $pageResults = [System.Collections.Generic.List[object]]::new()
                 $Query = [string]$SearchItems.Content.'@odata.nextLink'
-                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query #-Headers @{ Prefer = 'IdType="ImmutableId"' }
+                $SearchItems = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -Headers @{ Prefer = 'IdType="ImmutableId"' }
                 if($SearchItems.Successful -eq $false){
                     Write-Log "Search failed for folder $($MailboxFolder.displayName)." -Level WARN
                     Write-Log "Error: $($SearchItems.ErrorMessage)" -Level WARN
                     $searchFailures++
+                    [void]$Script:IncompleteSearchFolders.Add([string]$MailboxFolder.displayName)
                     continue
                 }
                 else{
@@ -1385,7 +1441,7 @@ function SearchMailbox {
                         }
                     }
                     if ($pageResults.Count -gt 0) {
-                        $pageResults | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                        $pageResults | ConvertTo-SafeCsvRecord | Export-Csv -Path $Script:searchResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
                     }
                 }
             }
@@ -1399,6 +1455,8 @@ function SearchMailbox {
         if($DeleteContent -and $Script:folderSearchResults.count -gt 0){
             if($searchFailures -gt 0){
                 Write-Log "Warning: There were $searchFailures errors during the search process." -Level WARN
+                Write-Log "These search results are incomplete and may not include all items that match the search criteria." -Level WARN
+                Write-Log "Do you still want to delete the items found?" -Level WARN
                 $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
                 $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
                 $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
@@ -1407,7 +1465,6 @@ function SearchMailbox {
                     Write-Log "User chose not to delete items due to search errors." -Level INFO
                     continue
                 }
-                $ConfirmDelete = $false
             }
             #Confirm with the user that they want to continue with the delete since all folders will be searched
             elseif($ConfirmDelete){ 
@@ -1420,12 +1477,11 @@ function SearchMailbox {
                     $ConfirmDelete = $false
                 }
             }
-            if($confirmation -eq 0 -or $ConfirmDelete -eq $false){
+            if(($confirmation -eq 0 -or $confirmation -eq 2) -or $ConfirmDelete -eq $false){
                 #User has confirmed to continue with the delete, so proceed with the delete operation and don't prompt again
                 Write-Log "Deleting $($Script:folderSearchResults.Count) items from $($MailboxFolder.displayName)..." -Level WARN
                 [int]$Script:itemsDeleted = 0
                 [int]$Script:itemsFailedDelete = 0
-                [int]$Script:itemsRetry = 0
                 [int]$itemsProcessed = 0
                 #prevent batch size being reduced from previous folder search results
                 $currentBatchSize = $BatchSize
@@ -1441,7 +1497,7 @@ function SearchMailbox {
                         $currentBatchSize = $Script:folderSearchResults.Count - $itemsProcessed
                     }
                     #Create an array of requests to send to the batch endpoint
-                    $requests = New-Object System.Collections.ArrayList
+                    $requests = [System.Collections.Generic.List[object]]::new()
                     #Create a hash table to track delete status for each item in the batch.
                     $itemIdLookup = @{}
 
@@ -1480,36 +1536,46 @@ function SearchMailbox {
 
                         Write-Log "Sending batch delete request ($($pendingRequests.Count) items, total deleted so far: $itemsDeleted)" -Level DEBUG
                         $batchDeleteResponse = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query -Method POST -Body $batchRequest
-        
+                        #Setup for list of requests to retry if any of the responses return a 429 status code
+                        $retryRequests = [System.Collections.Generic.List[object]]::new()
+                        $retryAfterSeconds = 0
+  
                         #Check the responses from the batch for any failures
                         if($batchDeleteResponse.Successful -eq $false){
                             Write-Log "Batch request to delete items failed." -Level WARN
                             Write-Log "Error: $($batchDeleteResponse.ErrorMessage)" -Level WARN
-                            $Script:itemsFailedDelete = $Script:itemsFailedDelete + $currentBatchSize
+                            $Script:itemsFailedDelete += $pendingRequests.Count
+                            $Script:TotalDeleteFailures += $pendingRequests.Count
+                            [void]$Script:DeleteFailureFolders.Add([string]$MailboxFolder.displayName)
                             #Entire batch failed, so log all items in the batch as failed to delete
-                            $deleteFailed = foreach($entry in $itemIdLookup.GetEnumerator()) { 
-                            [PSCustomObject]@{ 
-                                Mailbox=$entry.value.mailbox
-                                Id=$entry.value.id
-                                Folder=$entry.value.folder
-                                Subject=$entry.value.subject
-                                ReceivedDateTime=$entry.value.receivedDateTime
-                                From=$entry.value.from
-                                Attachment=$entry.value.attachment
-                                DeleteStatus='Failed'
+                            $deleteFailed = foreach ($request in $pendingRequests) {
+                                $item = $itemIdLookup[[int]$request.Id]
+
+                                if ($null -eq $item) {
+                                    throw "Unable to correlate failed batch request ID '$($request.Id)' with its source message."
+                                }
+
+                                [PSCustomObject]@{
+                                    Mailbox          = $item.mailbox
+                                    Id               = $item.id
+                                    Folder           = $item.folder
+                                    InternetMessageId = $item.internetMessageId
+                                    Subject          = $item.subject
+                                    ReceivedDateTime = $item.receivedDateTime
+                                    From             = $item.from
+                                    Attachment       = $item.attachment
+                                    StatusCode       = $batchDeleteResponse.StatusCode
+                                    DeleteStatus     = "Failed"
+                                }
                             }
-                            }
-                            $deleteFailed | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                            $deleteFailed | ConvertTo-SafeCsvRecord | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                            break
                         }
                         else{
-                            #Setup for list of requests to retry if any of the responses return a 429 status code
-                            $retryRequests = [System.Collections.Generic.List[object]]::new()
-                            $retryAfterSeconds = 0
-
                             $deleteResults = [System.Collections.Generic.List[object]]::new()
                             #Check the response for each delete request
                             foreach($response in $batchDeleteResponse.Content.Responses){
-                                $result = ConvertTo-DeleteResult -Response $response -currentBatch $itemIdLookup
+                                $result = ConvertTo-DeleteResult -Response $response -currentBatch $itemIdLookup -IsFinalAttempt ($attempt -eq $maxAttempts)
                                 if($result.StatusCode -eq 429 -and $attempt -lt $maxAttempts){
                                     #If the request failed with a 429 status code, add it to the list of requests to retry and determine the delay before retrying based on the Retry-After header in the response.
                                     $requestToRetry = $pendingRequests |  Where-Object { [string]$_.Id -eq [string]$response.Id } | Select-Object -First 1
@@ -1526,7 +1592,7 @@ function SearchMailbox {
                                     $deleteResults.Add($result)
                                 }
                             }
-                            $deleteResults | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
+                            $deleteResults | ConvertTo-SafeCsvRecord | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
                             Write-Log (
                                 "Batch delete completed: {0} responses, {1} succeeded, {2} failed, {3} retried." -f
                                     $deleteResults.Count,
@@ -1547,7 +1613,7 @@ function SearchMailbox {
                         }
                     }
                 }
-                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsProcessed processed; $Script:itemsDeleted succeeded; ($Script:itemsFailedDelete + $Script:itemsRetried) failed; " -Level INFO
+                Write-Log "Delete complete for folder $($MailboxFolder.displayName). $itemsProcessed processed; $Script:itemsDeleted succeeded; $Script:itemsFailedDelete failed; " -Level INFO
             }
         }
     }   
@@ -1616,7 +1682,7 @@ function CreateSearchQuery {
 function GetFolderList{
     Write-Log "Getting a list of folders in the mailbox..." -Level INFO
     #Create an arraylist to hold the folder results
-    $Script:folderList = New-Object System.Collections.ArrayList
+    $Script:folderList = [System.Collections.Generic.List[object]]::new()
     [string]$Query = "users/$($Script:userMailbox)/mailFolders/delta"
     $params = @{
         GraphApiUrl         = $cloudService.graphApiEndpoint
@@ -1635,6 +1701,11 @@ function GetFolderList{
     while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
         $Query = [string]$Script:FolderResults.Content.'@odata.nextLink'
         $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
+        if($Script:FolderResults.Successful -eq $false){
+            Write-Log "Unable to get a list of folders in the mailbox. Please review the error message below and re-run the script:" -Level ERROR
+            Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
+            exit 1
+        }
         foreach($Result in $Script:FolderResults.Content.Value){
             $Script:folderList.Add($Result) | Out-Null
         }
@@ -1701,55 +1772,39 @@ function BuildFolderListTree{
 function GetRecoverableItemsFolderList{
     Write-Log "Getting a list of folders in the recoverable items..." -Level INFO
     #Create an arraylist to hold the folder results
-    $Script:folderList = New-Object System.Collections.ArrayList
-    [string]$Query = "users/$($Script:userMailbox)/mailFolders/RecoverableItemsRoot/childfolders/?includeHiddenFolders=true"
+    $Script:folderList = [System.Collections.Generic.List[object]]::new()
+    $queue = [System.Collections.Generic.Queue[object]]::new()
+    $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
-    $params = @{
-        GraphApiUrl         = $cloudService.graphApiEndpoint
-        Query               = $Query
-    }
-    $Script:FolderResults = Invoke-GraphApiRequest @params
-    #Check for errors in the folder enumeration request and log them if found, then exit the script
-    if($Script:FolderResults.Successful -eq $false){
-        Write-Log "Unable to get a list of folders in the recoverable items. Please review the error message below and re-run the script:" -Level ERROR
-        Write-Log $Script:FolderResults.ErrorMessage -Level ERROR
-        exit 1
-    }
-    foreach($Result in $Script:FolderResults.Content.Value){
-        $Script:folderList.Add($Result) | Out-Null
-    }    
-    while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
-        $Query = [string]$Script:FolderResults.Content.'@odata.nextLink'
-        $Script:FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
-        foreach($Result in $Script:FolderResults.Content.Value){
-            $Script:folderList.Add($Result) | Out-Null
+    $queue.Enqueue([PSCustomObject]@{
+        id = "RecoverableItemsRoot"
+    })
+
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+
+        if (-not $visited.Add([string]$parent.id)) {
+            continue
         }
-    }
 
-    #Get subfolders for each folder in the recoverable items
-    $subfolderList = New-Object System.Collections.ArrayList
-    foreach($folder in $Script:folderList){
-        $Query = "users/$($Script:userMailbox)/mailFolders/$($folder.id)/childfolders/?includeHiddenFolders=true"
-        $params = @{
-            GraphApiUrl         = $cloudService.graphApiEndpoint
-            Query               = $Query
-        }
-        $FolderResults = Invoke-GraphApiRequest @params
+        $nextLink = "users/$($Script:userMailbox)/mailFolders/$($parent.id)/childFolders?includeHiddenFolders=true"
 
-        foreach($Result in $FolderResults.Content.Value){
-            $subfolderList.Add($Result) | Out-Null
-        }    
-        while($null -ne $FolderResults.Content.'@odata.nextLink'){
-            $Query = [string]$FolderResults.Content.'@odata.nextLink'
-            $FolderResults = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $Query
-            foreach($Result in $FolderResults.Content.Value){
-                $subfolderList.Add($Result) | Out-Null
+        while ($nextLink) {
+            $page = Invoke-GraphApiRequest -GraphApiUrl $cloudService.graphApiEndpoint -Query $nextLink
+
+            if (-not $page.Successful) {
+                throw "Failed to enumerate children of Recoverable Items folder '$($parent.id)': $($page.ErrorMessage)"
             }
+
+            foreach ($folder in @($page.Content.Value)) {
+                [void]$Script:folderList.Add($folder)
+                $queue.Enqueue($folder)
+            }
+
+            $nextLink = $page.Content.'@odata.nextLink'
         }
     }
-    foreach($subfolder in $subfolderList){
-        $Script:folderList.Add($subfolder) | Out-Null
-    }
+
     BuildFolderListTree
     Write-Log "Recoverable items enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
 }
@@ -1786,13 +1841,13 @@ if(-not([string]::IsNullOrEmpty($IncludeFolderList))){
     if($IncludeFolderList -isnot [System.Collections.ArrayList] -and $IncludeFolderList -isnot [array]){
         $IncludeFolderList = @($IncludeFolderList)
     }
-    foreach($folder in $IncludeFolderList){
-        if(-not($folder.StartsWith("\"))){
-            $IncludeFolderList[$IncludeFolderList.IndexOf($folder)] = "\" + $folder
+    for ($i = 0; $i -lt $IncludeFolderList.Count; $i++) {
+        $normalized = ([string]$IncludeFolderList[$i]).Trim().Trim('\')
+
+        if ([string]::IsNullOrWhiteSpace($normalized)) {
+            throw "IncludeFolderList contains an empty folder path."
         }
-        if($folder.EndsWith("\")){
-            $IncludeFolderList[$IncludeFolderList.IndexOf($folder)] = $folder.TrimEnd("\")
-        }
+        $IncludeFolderList[$i] = "\$normalized"
     }
 }
 if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
@@ -1800,13 +1855,13 @@ if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
     if($ExcludeFolderList -isnot [System.Collections.ArrayList] -and $ExcludeFolderList -isnot [array]){
         $ExcludeFolderList = @($ExcludeFolderList)
     }
-    foreach($folder in $ExcludeFolderList){
-        if(-not($folder.StartsWith("\"))){
-            $ExcludeFolderList[$ExcludeFolderList.IndexOf($folder)] = "\" + $folder
+    for ($i = 0; $i -lt $ExcludeFolderList.Count; $i++) {
+        $normalized = ([string]$ExcludeFolderList[$i]).Trim().Trim('\')
+
+        if ([string]::IsNullOrWhiteSpace($normalized)) {
+            throw "ExcludeFolderList contains an empty folder path."
         }
-        if($folder.EndsWith("\")){
-            $ExcludeFolderList[$ExcludeFolderList.IndexOf($folder)] = $folder.TrimEnd("\")
-        }
+        $ExcludeFolderList[$i] = "\$normalized"
     }
 }
 try{
@@ -1858,11 +1913,29 @@ else{
 #Determine the folder to search based on include/exclude lists
 Write-Log "Determining folders to search..." -Level INFO
 #Create an arraylist to hold the folders to be searched
-$Script:searchFolders = New-Object System.Collections.ArrayList
+$Script:searchFolders = [System.Collections.Generic.List[object]]::new()
+$searchFolderIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+function Add-SearchFolder {
+    param([Parameter(Mandatory)][object]$Folder)
+
+    $folderId = [string]$Folder.id
+    if ([string]::IsNullOrWhiteSpace($folderId)) {
+        throw "A selected folder has no valid Graph folder ID."
+    }
+
+    if ($searchFolderIds.Add($folderId)) {
+        $Script:searchFolders.Add($Folder)
+    }
+}
+
 #Check is specific folders are specified in the include list, if not, search all folders under the root
 if([string]::IsNullOrEmpty($IncludeFolderList)){
     #If no include list is specified, search all folders under the desired root
-    $Script:searchFolders = $Script:folderListTree
+    #$Script:searchFolders = $Script:folderListTree
+    foreach ($folder in $Script:folderListTree) {
+        Add-SearchFolder -Folder $folder
+    }
     if(-not($ExcludeFolderList)){
         Write-Log "No include list specified. Searching all folders ($($Script:searchFolders.Count) folders)..." -Level WARN
         $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
@@ -1872,13 +1945,14 @@ if([string]::IsNullOrEmpty($IncludeFolderList)){
         #Confirm with the user that they want to continue with the search since all folders will be searched
         if($confirmation -ne 0){
             Write-Log "Search cancelled by user." -Level WARN
-            exit
+            exit 3
         }
     }
 }
 else {
     Write-Log "Building folder search list from include list..." -Level INFO
     #Add folders that match the include list
+    <#
     if($ProcessSubfolders){
         foreach($folder in $IncludeFolderList){
             #Add all subfolders of the specified folder to the search list
@@ -1909,19 +1983,64 @@ else {
             }
         }
     }
+    #>
+    foreach ($folderPath in $IncludeFolderList) {
+        if ($ProcessSubfolders) {
+            $matches = @(
+                $Script:folderListTree | Where-Object {
+                    $_.displayName -match "^$([regex]::Escape($folderPath))($|\\)"
+                }
+            )
+        }
+        else {
+            $matches = @(
+                $Script:folderListTree | Where-Object {
+                    [string]::Equals([string]$_.displayName,[string]$folderPath,[StringComparison]::OrdinalIgnoreCase)
+                }
+            )
+        }
+
+        if ($matches.Count -eq 0) {
+            throw "Included folder '$folderPath' was not found."
+        }
+
+        foreach ($match in $matches) {
+            Add-SearchFolder -Folder $match
+        }
+
+        if ($Archive -and -not $ProcessSubfolders) {
+            $auxSubfolders = @(
+                $Script:folderListTree | Where-Object {
+                    $_.displayName -match "^$([regex]::Escape($folderPath))\\"
+                } | Where-Object {
+                        $parts = $_.displayName -split '\\'
+                        $rootFolder = $parts[-2]
+                        $lastPart = $parts[-1]
+                        $lastPart -match "^$([regex]::Escape($rootFolder))_\d{4}\s+\(Created on"
+                    }
+            )
+
+            foreach ($auxSubfolder in $auxSubfolders) {
+                Add-SearchFolder -Folder $auxSubfolder
+            }
+        }
+    }
 }
 
+
+
 #Remove folders that match the exclude list and includes all subfolders
-$removeFolderList = New-Object System.Collections.ArrayList
+$removeFolderList = [System.Collections.Generic.List[object]]::new()
 if($ExcludeFolderList){
     Write-Log "Removing excluded folders from the list..." -Level INFO
     #Find all folders that match the exclude list and add them to the remove list
+    <#
     foreach ($exclude in $ExcludeFolderList) {
         [void]$removeFolderList.Add(($Script:searchFolders | Where-Object { $_.displayName -eq $exclude}))
     }
     #Remove the excluded folders and all subfolders from the search list
     if($removeFolderList.Count -gt 0){
-        $newSearchFolders = New-Object System.Collections.ArrayList
+        $newSearchFolders = [System.Collections.Generic.List[object]]::new()
         foreach($folder in $Script:searchFolders){
             $shouldExclude = $false
             foreach($exclude in $ExcludeFolderList){
@@ -1937,25 +2056,84 @@ if($ExcludeFolderList){
         $Script:searchFolders = $newSearchFolders
         $newSearchFolders = $null
     }
+    #>
+    foreach ($exclude in $ExcludeFolderList) {
+        $excludeExists = @(
+            $Script:folderListTree | Where-Object {
+                    [string]::Equals([string]$_.displayName,[string]$exclude,[StringComparison]::OrdinalIgnoreCase)
+            }
+        ).Count -gt 0
+
+        if (-not $excludeExists) {
+            throw "Excluded folder '$exclude' was not found. Deletion cannot safely continue."
+        }
+    }
+
+    $newSearchFolders = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($folder in $Script:searchFolders) {
+        $shouldExclude = $false
+
+        foreach ($exclude in $ExcludeFolderList) {
+            if ([string]::Equals([string]$folder.displayName,[string]$exclude,[StringComparison]::OrdinalIgnoreCase) -or
+                $folder.displayName.StartsWith("$exclude\",[StringComparison]::OrdinalIgnoreCase)){
+                    $shouldExclude = $true
+                    break
+            }
+        }
+
+        if (-not $shouldExclude) {
+            $newSearchFolders.Add($folder)
+        }
+    }
+
+    $Script:searchFolders = $newSearchFolders
 }
+
+if ($Script:searchFolders.Count -eq 0) {
+    throw "No folders remain in the search list."
+}
+
 
 Write-Log "Final list of folders to be searched ($($Script:searchFolders.Count) folders):" -Level INFO
 $Script:searchFolders | ForEach-Object { Write-Log "  $($_.displayName)" -Level DEBUG }
 $Script:searchFolders | Format-Table displayName
 
 #Create csv file to hold the search results
-$Script:searchResultsCsvPath = "$($OutputPath)\SearchResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$Script:searchResultsCsvPath = Join-Path $OutputPath "SearchResults_$($Script:RunId).csv"
 Write-Log "Search results will be saved to: $($Script:searchResultsCsvPath)" -Level INFO
 if($DeleteContent){
-    $Script:deleteResultsCsvPath = "$($OutputPath)\DeleteResults_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    $Script:deleteResultsCsvPath = Join-Path $OutputPath "DeleteResults_$($Script:RunId).csv"
     Write-Log "Delete results will be saved to: $($Script:deleteResultsCsvPath)" -Level INFO
 }
+
+[int64]$Script:TotalItemsDeleted = 0
+[int64]$Script:TotalDeleteFailures = 0
+$Script:DeleteFailureFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 #Initiate the search against the mailbox using the specified query and parameters
 SearchMailbox -uriQuery "/users/$Script:userMailbox/mailFolders"
-
-Write-Log "Search complete. $Script:TotalSearchResults item(s) found in total." -Level INFO
+if ($Script:IncompleteSearchFolders.Count -gt 0) {
+    Write-Log (
+        "Search completed incompletely. {0} folder(s) could not be fully searched: {1}" -f
+        $Script:IncompleteSearchFolders.Count,
+        ($Script:IncompleteSearchFolders -join "; ")
+    ) -Level ERROR
+}
 #Export the search results to a CSV file
-Write-Log "Results exported to: $($Script:searchResultsCsvPath)" -Level INFO
+if($Script:TotalSearchResults -gt 0){
+    Write-Log "Search complete. $Script:TotalSearchResults item(s) found in total." -Level INFO
+    Write-Log "Search results exported to: $($Script:searchResultsCsvPath)" -Level INFO
+}
+if ($Script:TotalItemsDeleted -gt 0) {
+    Write-Log (
+        "Deletion completed with failures. {0} succeeded; {1} failed. Affected folders: {2}" -f
+        $Script:TotalItemsDeleted,
+        $Script:TotalDeleteFailures,
+        ($Script:DeleteFailureFolders -join "; ")
+    ) -Level INFO
+    Write-Log "Delete results exported to: $($Script:deleteResultsCsvPath)" -Level INFO
+}
 Write-Log "Script completed. Log file: $($Script:LogFile)" -Level INFO
 }
 finally{
