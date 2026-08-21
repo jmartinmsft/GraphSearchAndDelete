@@ -22,11 +22,14 @@
     SOFTWARE
 #>
 
-# Version 20260820.1426
+# Version 20260821.1529
 
+[CmdletBinding()]
 param (
     [Parameter(Position=0,Mandatory=$false,HelpMessage="The Mailbox parameter specifies the mailbox to be accessed.")]
-    [ValidateNotNullOrEmpty()] 
+    [ValidateNotNullOrEmpty()]
+    # Reject characters that could alter the Graph request path (path traversal / query injection).
+    [ValidatePattern('^[^\\/?#&\s]+$')]
     [string]$Mailbox,
 
     [Parameter(Mandatory=$False, HelpMessage="The Archive parameter is a switch to search the archive mailbox (otherwise, the main mailbox is searched).")]
@@ -63,7 +66,9 @@ param (
     [Parameter(Mandatory=$False,HelpMessage="The OAuthSecretKey parameter is the the secret for the registered application.")] 
     [SecureString]$OAuthClientSecret,
     
-    [Parameter(Mandatory=$False,HelpMessage="The OAuthCertificate parameter is the certificate for the registered application. Certificate auth requires MSAL libraries to be available.")] 
+    [Parameter(Mandatory=$False,HelpMessage="The OAuthCertificate parameter is the certificate thumbprint for the registered application. Certificate auth requires MSAL libraries to be available.")] 
+    # A thumbprint is hex only. Rejecting anything else stops the value being used to traverse the Cert: provider.
+    [ValidatePattern('^[0-9a-fA-F]+$')]
     [string]$OAuthCertificate,
   
     [Parameter(Mandatory=$False,HelpMessage="The CertificateStore parameter specifies the certificate store where the certificate is loaded.")] [ValidateSet("CurrentUser", "LocalMachine")]
@@ -105,7 +110,7 @@ param (
     [ValidateRange(1, 500)]
     [int]$ResultSize = 500,
 
-    [ValidateScript({ Test-Path $_ })]
+    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Container })]
     [Parameter(Mandatory = $true, HelpMessage="The OutputPath parameter specifies the path for the EWS usage report.")]
     [string]$OutputPath,
 
@@ -129,7 +134,16 @@ function Write-Log {
         [string]$Level = "INFO"
     )
 
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    # Defence in depth: strip credentials from every entry regardless of what the caller passed.
+    # The cheap IndexOf checks avoid running two regexes over every one of the (many) DEBUG entries.
+    if ($Message.IndexOf('=') -ge 0) {
+        $Message = $Message -replace '(?i)(([?&]code|id_token|access_token|refresh_token|client_secret|client_assertion|assertion)=)[^&\s"'']+', '$1<redacted>'
+    }
+    if ($Message.IndexOf('Bearer', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $Message = $Message -replace '(?i)(Bearer\s+)[A-Za-z0-9\-\._~\+\/]+=*', '$1<redacted>'
+    }
+
+    $timestamp = [datetime]::Now.ToString("yyyy-MM-dd HH:mm:ss")
     $entry = "[$timestamp] [$Level] $Message"
 
     if ($null -ne $Script:LogWriter) {
@@ -165,8 +179,19 @@ $Script:LogFile = Join-Path $OutputPath "GraphSearch_$($Script:RunId).log"
 
 Initialize-Log -Path $Script:LogFile
 
+# Some hosts (Windows PowerShell 5.1) still negotiate TLS 1.0/1.1 by default, which AAD and Graph reject.
+try {
+    if (([System.Net.ServicePointManager]::SecurityProtocol -band [System.Net.SecurityProtocolType]::Tls12) -ne [System.Net.SecurityProtocolType]::Tls12) {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    }
+} catch {
+    Write-Log "Unable to enforce TLS 1.2: $($_.Exception.Message)" -Level DEBUG
+}
+
 Write-Log "Script started. Mailbox: $Mailbox | Archive: $Archive | SearchDumpster: $SearchDumpster | PermissionType: $PermissionType"
-Write-Log "Output path: $OutputPath | Log file: $Script:LogFile"
+Write-Log "Action: DeleteContent=$DeleteContent | HardDelete=$HardDelete | ConfirmDelete=$ConfirmDelete | BatchSize=$BatchSize | ResultSize=$ResultSize"
+Write-Log ("Criteria: Subject='{0}' | Sender='{1}' | AttachmentName='{2}' | MessageBody='{3}' | ReceivedAfter='{4}' | ReceivedBefore='{5}'" -f $Subject, $Sender, $AttachmentName, $MessageBody, $ReceivedAfter, $ReceivedBefore)
+Write-Log ("Scope: ProcessSubfolders={0} | IncludeFolderList='{1}' | ExcludeFolderList='{2}'" -f $ProcessSubfolders, ($IncludeFolderList -join '; '), ($ExcludeFolderList -join '; '))
 #endregion
 
 function Get-CloudServiceEndpoint {
@@ -267,12 +292,13 @@ function Get-NewJsonWebToken {
     }
     process {
         try {
-            $certificate = Get-ChildItem Cert:\$CertificateStore\My\$CertificateThumbprint
+            $certificate = Get-ChildItem -LiteralPath "Cert:\$CertificateStore\My\$CertificateThumbprint"
             if ($certificate.HasPrivateKey) {
                 $privateKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($certificate)
                 # Base64url-encoded SHA-1 thumbprint of the X.509 certificate's DER encoding
                 $x5t = [System.Convert]::ToBase64String($certificate.GetCertHash())
-                $x5t = ((($x5t).Replace("\+", "-")).Replace("/", "_")).Replace("=", "")
+                #$x5t = ((($x5t).Replace("\+", "-")).Replace("/", "_")).Replace("=", "")
+                $x5t = ((($x5t).Replace("+", "-")).Replace("/", "_")).Replace("=", "")                
                 Write-Log "x5t is: $x5t" -Level DEBUG
             } else {
                 Write-Log "We don't have a private key for certificate: $CertificateThumbprint and so cannot sign the token" -Level DEBUG
@@ -330,7 +356,13 @@ function Get-NewJsonWebToken {
         }
         Write-Log "Signing the Json Web Token using: $SigningAlgorithm" -Level DEBUG
 
-        $signature = $privateKey.SignData($signatureInput, $signingAlgorithmToUse, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        try {
+            $signature = $privateKey.SignData($signatureInput, $signingAlgorithmToUse, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        }
+        finally {
+            # Release the private key handle rather than waiting for the finalizer.
+            if ($null -ne $privateKey) { $privateKey.Dispose() }
+        }
         $signature = [Convert]::ToBase64String($signature).Split("=")[0].Replace("+", "-").Replace("/", "_")
     }
     end {
@@ -351,7 +383,8 @@ function Get-ApplicationAccessToken {
     param (
         [Parameter(Mandatory = $true)][string]$TenantID,
         [Parameter(Mandatory = $true)][string]$ClientID,
-        [Parameter(Mandatory = $true)][string]$Secret,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Secret')][SecureString]$ClientSecret,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Certificate')][string]$ClientAssertion,
         [Parameter(Mandatory = $true)][string]$Endpoint,
         [Parameter(Mandatory = $false)][string]$TokenService = "oauth2/v2.0/token",
         [Parameter(Mandatory = $false)][switch]$CertificateBasedAuthentication,
@@ -382,21 +415,22 @@ function Get-ApplicationAccessToken {
         if ($CertificateBasedAuthentication) {
             Write-Log "Function was called with CertificateBasedAuthentication switch" -Level DEBUG
             $body.Add("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
-            $body.Add("client_assertion", $Secret)
+            $body.Add("client_assertion", $ClientAssertion)
         } else {
             Write-Log "Authentication is based on a secret" -Level DEBUG
             $bstr = [IntPtr]::Zero
             $plainSecret = $null
             try {
-                $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($OAuthClientSecret)
+                $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($ClientSecret)
                 $plainSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
                 $body.client_secret = $plainSecret
             }
             finally{
-                $plainSecret = $null
                 if ($bstr -ne [IntPtr]::Zero) {
                     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
                 }
+                # Drop the last managed reference to the plaintext secret.
+                $plainSecret = $null
             }
         }
 
@@ -420,8 +454,8 @@ function Get-ApplicationAccessToken {
         
         finally{
             $body.Remove("client_secret")
+            $body.Remove("client_assertion")
         }
-        #>
     }
     end {
         return [PSCustomObject]@{
@@ -433,6 +467,27 @@ function Get-ApplicationAccessToken {
     }
 }
 
+function New-ClientAssertion {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Thumbprint,
+        [Parameter(Mandatory = $true)][string]$ClientId,
+        [Parameter(Mandatory = $true)][string]$TenantId,
+        [Parameter(Mandatory = $true)][string]$AzureADEndpoint
+    )
+
+    $jwt = Get-NewJsonWebToken -CertificateThumbprint $Thumbprint `
+                               -CertificateStore      $CertificateStore `
+                               -Issuer                $ClientId `
+                               -Subject               $ClientId `
+                               -Audience              "$AzureADEndpoint/$TenantId/oauth2/v2.0/token"
+
+    if ([string]::IsNullOrEmpty($jwt)) {
+        throw "Unable to generate a client assertion from certificate $Thumbprint."
+    }
+    return $jwt
+}
 function Update-AccessTokenIfNeeded {
     param(
         [switch]$Force
@@ -453,27 +508,14 @@ function Update-AccessTokenIfNeeded {
             ClientID = $Script:applicationInfo.ClientID
             Endpoint = $cloudService.AzureADEndpoint
             Scope    = $Script:GraphScope
-            CertificateBasedAuthentication = -not [string]::IsNullOrEmpty(
-                $Script:applicationInfo.CertificateThumbprint
-            )
         }
 
-        if ($tokenParams.CertificateBasedAuthentication) {
-            $jwt = Get-NewJsonWebToken `
-                -CertificateThumbprint $Script:applicationInfo.CertificateThumbprint `
-                -CertificateStore $CertificateStore `
-                -Issuer $Script:applicationInfo.ClientID `
-                -Subject $Script:applicationInfo.ClientID `
-                -Audience "$($cloudService.AzureADEndpoint)/$($Script:applicationInfo.TenantID)/oauth2/v2.0/token"
-
-            if (-not $jwt) {
-                throw "Unable to generate a certificate assertion."
-            }
-
-            $tokenParams.Secret = $jwt
+        if (-not [string]::IsNullOrEmpty($Script:applicationInfo.CertificateThumbprint)) {
+            $tokenParams.CertificateBasedAuthentication = $true
+            $tokenParams.ClientAssertion = New-ClientAssertion -Thumbprint $Script:applicationInfo.CertificateThumbprint -ClientId $Script:applicationInfo.ClientID -TenantId $Script:applicationInfo.TenantID -AzureADEndpoint $cloudService.AzureADEndpoint
         }
         else {
-            $tokenParams.Secret = $Script:applicationInfo.AppSecret
+            $tokenParams.ClientSecret = $Script:applicationInfo.ClientSecret
         }
 
         $result = Get-ApplicationAccessToken @tokenParams
@@ -550,15 +592,46 @@ function Get-DelegatedAccessToken {
         $codeChallenge = $codeChallengeVerifier.CodeChallenge
         $codeVerifier = $codeChallengeVerifier.Verifier
 
-        # Request an authorization code from the Microsoft Azure Active Directory endpoint
-        $authCodeRequestUrl = "$AzureADEndpoint/organizations/oauth2/v2.0/authorize?client_id=$clientId" +
-        "&response_type=$responseType&redirect_uri=$redirectUri&scope=$scope&state=$state&prompt=$prompt" +
+        # Request an authorization code from the Microsoft Azure Active Directory endpoint.
+        # Values are percent-encoded so the URL survives Start-Process argument parsing (scope contains spaces).
+        $authCodeRequestUrl = "$AzureADEndpoint/organizations/oauth2/v2.0/authorize?client_id=$([Uri]::EscapeDataString($ClientID))" +
+        "&response_type=$responseType&redirect_uri=$([Uri]::EscapeDataString($RedirectUri))&scope=$([Uri]::EscapeDataString($Scope))&state=$state&prompt=$prompt" +
         "&code_challenge_method=$codeChallengeMethod&code_challenge=$codeChallenge"
 
+        # Listen on the port declared by the redirect URI rather than assuming the default.
+        $listenerPort = 8004
+        $parsedRedirect = $null
+        if ([Uri]::TryCreate($RedirectUri, [UriKind]::Absolute, [ref]$parsedRedirect) -and $parsedRedirect.Port -gt 0) {
+            $listenerPort = $parsedRedirect.Port
+        }
+
+        # Start-Process will happily launch anything; make sure we only ever hand it a web URL.
+        if ($authCodeRequestUrl -notmatch '^https://') {
+            Write-Log "Refusing to launch a non-HTTPS authorization URL." -Level ERROR
+            return
+        }
+
         Start-Process -FilePath $authCodeRequestUrl
-        $authCodeResponse = Start-LocalListener
+        $authCodeResponse = Start-LocalListener -Port $listenerPort
 
         if ($null -ne $authCodeResponse) {
+            $returnedCode  = Get-UrlQueryParameter -Url $authCodeResponse -Name 'code'
+            $returnedState = Get-UrlQueryParameter -Url $authCodeResponse -Name 'state'
+
+            if ([string]::IsNullOrEmpty($returnedCode)) {
+                Write-Log "The redirect did not contain an authorization code." -Level ERROR
+                return
+            }
+
+            # The value taken from RawUrl is still percent-encoded; decode it so the form post does not double-encode it.
+            $returnedCode = [Uri]::UnescapeDataString($returnedCode)
+
+            # Verify the CSRF state so an injected authorization code cannot be redeemed.
+            if (-not [string]::Equals([Uri]::UnescapeDataString([string]$returnedState), $state, [StringComparison]::Ordinal)) {
+                Write-Log "OAuth state mismatch detected. The authorization response did not originate from this request and will be discarded." -Level ERROR
+                return
+            }
+
             # Redeem the returned code for an access token
             $redeemAuthCodeParams = @{
                 Uri             = "$AzureADEndpoint/organizations/oauth2/v2.0/token"
@@ -567,7 +640,7 @@ function Get-DelegatedAccessToken {
                 Body            = @{
                     client_id     = $ClientID
                     scope         = $Scope
-                    code          = ($($authCodeResponse.Split("=")[1]).Split("&")[0])
+                    code          = $returnedCode
                     redirect_uri  = $RedirectUri
                     grant_type    = "authorization_code"
                     code_verifier = $codeVerifier
@@ -591,76 +664,11 @@ function Get-DelegatedAccessToken {
             return [PSCustomObject]@{
                 AccessToken = $tokens.access_token
                 RefreshToken = $tokens.refresh_token
-                #TenantId    = (Convert-JsonWebTokenToObject $tokens.id_token).Payload.tid
                 LastTokenRefreshTime = (Get-Date)
                 Successful           = $true
             }
         }
         exit
-    }
-}
-
-function Convert-JsonWebTokenToObject {
-    param(
-        [Parameter(Mandatory = $true)][ValidatePattern("^([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_=]+)\.([a-zA-Z0-9_\-\+\/=]*)")][string]$Token
-    )
-
-    <#
-        This function can be used to split a JSON web token (JWT) into its header, payload, and signature.
-        The JWT is expected to be in the format of <header>.<payload>.<signature>.
-        The function returns a PSCustomObject with the following properties:
-            Header    - The header of the JWT
-            Payload   - The payload of the JWT
-            Signature - The signature of the JWT
-
-            It returns $null if the JWT is not in the expected format or conversion fails.
-    #>
-
-    begin {
-        Write-Log "Calling $($MyInvocation.MyCommand)" -Level DEBUG
-        function ConvertJwtFromBase64StringWithoutPadding {
-            param(
-                [Parameter(Mandatory = $true)]
-                [string]$Jwt
-            )
-            $Jwt = ($Jwt.Replace("-", "+")).Replace("_", "/")
-            switch ($Jwt.Length % 4) {
-                0 { return [System.Convert]::FromBase64String($Jwt) }
-                2 { return [System.Convert]::FromBase64String($Jwt + "==") }
-                3 { return [System.Convert]::FromBase64String($Jwt + "=") }
-                default { throw "The JWT is not a valid Base64 string." }
-            }
-        }
-    }
-    process {
-        $tokenParts = $Token.Split(".")
-        $tokenHeader = $tokenParts[0]
-        $tokenPayload = $tokenParts[1]
-        $tokenSignature = $tokenParts[2]
-
-        Write-Log "Now processing token header..." -Level DEBUG
-        $tokenHeaderDecoded = [System.Text.Encoding]::UTF8.GetString((ConvertJwtFromBase64StringWithoutPadding $tokenHeader))
-
-        Write-Log "Now processing token payload..." -Level DEBUG
-        $tokenPayloadDecoded = [System.Text.Encoding]::UTF8.GetString((ConvertJwtFromBase64StringWithoutPadding $tokenPayload))
-
-        Write-Log "Now processing token signature..." -Level DEBUG
-        $tokenSignatureDecoded = [System.Text.Encoding]::UTF8.GetString((ConvertJwtFromBase64StringWithoutPadding $tokenSignature))
-    }
-    end {
-        if (($null -ne $tokenHeaderDecoded) -and
-            ($null -ne $tokenPayloadDecoded) -and
-            ($null -ne $tokenSignatureDecoded)) {
-            Write-Log "Conversion of the token was successful" -Level DEBUG
-            return [PSCustomObject]@{
-                Header    = ($tokenHeaderDecoded | ConvertFrom-Json)
-                Payload   = ($tokenPayloadDecoded | ConvertFrom-Json)
-                Signature = $tokenSignatureDecoded
-            }
-        }
-
-        Write-Log "Conversion of the token failed" -Level DEBUG
-        return $null
     }
 }
 
@@ -686,26 +694,27 @@ function Get-NewS256CodeChallengeVerifier {
     Write-Log "Calling $($MyInvocation.MyCommand)" -Level DEBUG
 
     $bytes = [System.Byte[]]::new(64)
-    ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($bytes)
-    $b64String = [Convert]::ToBase64String($bytes)
-    $verifier = (($b64String.TrimEnd("=")).Replace("+", "-")).Replace("/", "_")
-
-    $newMemoryStream = [System.IO.MemoryStream]::new()
-    $newStreamWriter = [System.IO.StreamWriter]::new($newMemoryStream)
-    $newStreamWriter.write($verifier)
-    $newStreamWriter.Flush()
-    $newMemoryStream.Position = 0
-    $hash = Get-FileHash -InputStream $newMemoryStream | Select-Object Hash
-    $hex = $hash.Hash
-
-    $bytesArray = [byte[]]::new($hex.Length / 2)
-
-    for ($i = 0; $i -lt $hex.Length; $i+=2) {
-        $bytesArray[$i/2] = [Convert]::ToByte($hex.Substring($i, 2), 16)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    }
+    finally {
+        $rng.Dispose()
     }
 
-    $base64Encoded = [Convert]::ToBase64String($bytesArray)
-    $base64UrlEncoded = (($base64Encoded.TrimEnd("=")).Replace("+", "-")).Replace("/", "_")
+    $verifier = ([Convert]::ToBase64String($bytes).TrimEnd("=")).Replace("+", "-").Replace("/", "_")
+
+    # Hash the verifier directly. Get-FileHash required a MemoryStream/StreamWriter (never disposed) and
+    # returned a hex string that then had to be parsed back into bytes.
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $challengeBytes = $sha256.ComputeHash([System.Text.Encoding]::ASCII.GetBytes($verifier))
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    $base64UrlEncoded = ([Convert]::ToBase64String($challengeBytes).TrimEnd("=")).Replace("+", "-").Replace("/", "_")
 
     if ((-not([System.String]::IsNullOrEmpty($verifier))) -and
         (-not([System.String]::IsNullOrEmpty(($base64UrlEncoded))))) {
@@ -755,12 +764,12 @@ function Start-LocalListener {
             while ($listener.IsListening) {
                 $task = $listener.GetContextAsync()
 
+                # WaitOne already blocks for the poll interval; an extra Start-Sleep only doubled the response latency.
                 while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
                     if ($task.AsyncWaitHandle.WaitOne(100)) {
                         $signalled = $true
                         break
                     }
-                    Start-Sleep -Milliseconds 100
                 }
 
                 if ($signalled) {
@@ -779,7 +788,8 @@ function Start-LocalListener {
                         $response.Close()
                         break
                     } else {
-                        Write-Log "Request made to listener but the url that was called is not as expected. URL: $($url)" -Level DEBUG
+                        #Write-Log "Request made to listener but the url that was called is not as expected. URL: $($url)" -Level DEBUG
+                        Write-Log "Request made to listener but the url that was called is not as expected. HTTP method: $($request.HttpMethod) | URL: $(Get-RedactedUrl $url)" -Level DEBUG
                         $response.StatusCode = 404 # Not Found
                         $response.OutputStream.Write($content, 0, $content.Length)
                         $response.Close()
@@ -800,6 +810,76 @@ function Start-LocalListener {
     end {
         return $url
     }
+}
+
+function Get-UrlQueryParameter {
+    <#
+        Returns the raw (still percent-encoded) value of a named query string parameter.
+        Matching by name avoids relying on parameter ordering in the redirect response.
+        Returns $null when the parameter is not present.
+    #>
+    param(
+        [AllowNull()][string]$Url,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ([string]::IsNullOrEmpty($Url)) { return $null }
+
+    $queryIndex = $Url.IndexOf('?')
+    if ($queryIndex -lt 0) { return $null }
+
+    foreach ($pair in $Url.Substring($queryIndex + 1).Split('&')) {
+        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+
+        $separator = $pair.IndexOf('=')
+        if ($separator -lt 0) { continue }
+
+        if ([string]::Equals($pair.Substring(0, $separator), $Name, [StringComparison]::OrdinalIgnoreCase)) {
+            return $pair.Substring($separator + 1)
+        }
+    }
+
+    return $null
+}
+
+function Get-RedactedUrl {
+    <#
+        Returns a URL safe for logging: known credential-bearing query parameters have their
+        values replaced with a length placeholder. Everything else is preserved for diagnostics.
+    #>
+    param([AllowNull()][string]$Url)
+
+    if ([string]::IsNullOrEmpty($Url)) { return '<empty>' }
+
+    $sensitive = @(
+        'code', 'id_token', 'access_token', 'refresh_token',
+        'client_secret', 'client_assertion', 'assertion', 'session_state'
+    )
+
+    $queryIndex = $Url.IndexOf('?')
+    if ($queryIndex -lt 0) { return $Url }
+
+    $path  = $Url.Substring(0, $queryIndex)
+    $query = $Url.Substring($queryIndex + 1)
+
+    $redacted = foreach ($pair in $query.Split('&')) {
+        if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+
+        $separator = $pair.IndexOf('=')
+        if ($separator -lt 0) { $pair; continue }
+
+        $name  = $pair.Substring(0, $separator)
+        $value = $pair.Substring($separator + 1)
+
+        if ($sensitive -contains $name.ToLowerInvariant()) {
+            "$name=<redacted:$($value.Length) chars>"
+        }
+        else {
+            "$name=$value"
+        }
+    }
+
+    return "$path`?$($redacted -join '&')"
 }
 
 function Invoke-GraphApiRequest {
@@ -864,10 +944,8 @@ function Invoke-GraphApiRequest {
         }
 
         $graphApiRequestParams = @{
-            #Uri             = "$GraphApiUrl/$Endpoint/$($Query.TrimStart("/"))"
             Uri             = $requestUri
-            #Header          = @{ Authorization = "Bearer $Script:Token" }
-            Header          = $requestHeaders
+            Headers         = $requestHeaders
             Method          = $Method
             ContentType     = $ContentType
             UseBasicParsing = $true
@@ -889,7 +967,7 @@ function Invoke-GraphApiRequest {
         if($Script:graphApiResponse.StatusCode -eq 401){
             Write-Log "Graph returned 401; forcing token refresh" -Level WARN
             Update-AccessTokenIfNeeded -Force
-            $graphApiRequestParams.Header.Authorization = "Bearer $Script:Token"
+            $graphApiRequestParams.Headers.Authorization = "Bearer $Script:Token"
             $Script:graphApiResponse = Invoke-WebRequestWithProxyDetection -ParametersObject $graphApiRequestParams
         }
         if (($null -eq $graphApiResponse) -or
@@ -929,13 +1007,6 @@ function Invoke-WebRequestWithProxyDetection {
         $Uri = $ParametersObject.Uri
     }
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    if (Confirm-ProxyServer -TargetUri $Uri) {
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "PowerShell")
-        $webClient.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
-    }
-
     if ($null -eq $ParametersObject) {
         $params = @{
             Uri     = $Uri
@@ -947,6 +1018,11 @@ function Invoke-WebRequestWithProxyDetection {
         }
     } else {
         $params = $ParametersObject
+    }
+
+    # Must run after $params exists, otherwise the proxy credentials were silently dropped.
+    if (-not $params.ContainsKey('ProxyUseDefaultCredentials') -and (Confirm-ProxyServer -TargetUri $Uri)) {
+        $params.ProxyUseDefaultCredentials = $true
     }
     #Allow for maximum retries of 4 for throttling. This is a known issue with Graph API where it will return 429 for a period of time and then allow the request to go through.
     $maxAttempts = 4
@@ -1004,14 +1080,41 @@ function Invoke-WebRequestWithProxyDetection {
                             $reader.Dispose()
                         }
                     }
-                    $responseContent = $responseBody | ConvertFrom-Json
+                    $errorCode = $null
+                    $errorMessage = $null
+
+                    if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                        try {
+                            $responseContent = $responseBody | ConvertFrom-Json -ErrorAction Stop
+                            $errorCode = $responseContent.error.code
+                            $errorMessage = $responseContent.error.message
+                        }
+                        catch {
+                            Write-Log "Graph API returned a non-JSON error body: $($_.Exception.Message)" -Level DEBUG
+                        }
+                    }
+                    if ([string]::IsNullOrWhiteSpace($errorCode)) { $errorCode = "NonJsonErrorResponse" }
+                    if ([string]::IsNullOrWhiteSpace($errorMessage)) {
+                        $errorMessage = if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                            $responseBody.Trim()
+                        }
+                        else {
+                            $response.Exception.Message
+                        }
+                    }
+                    # HTML error pages can be very large; keep the log readable.
+                    if ($errorMessage.Length -gt 1000) {
+                        $errorMessage = $errorMessage.Substring(0, 1000) + "...[truncated]"
+                    }
+
                     Write-Log "Graph API request failed with status code: $statusCode" -Level DEBUG
-                    Write-Log "Error message: $($responseContent.error.message)" -Level DEBUG
+                    Write-Log "Error message: $errorMessage" -Level DEBUG
+
                     return [PSCustomObject]@{
-                        ErrorCode    = $responseContent.error.code
-                        ErrorMessage   = $responseContent.error.message
-                        StatusCode = [int]$httpResponse.StatusCode
-                        Successful = $false
+                        ErrorCode    = $errorCode
+                        ErrorMessage = $errorMessage
+                        StatusCode   = if ($null -ne $statusCode) { $statusCode } else { 0 }
+                        Successful   = $false
                     }
                 }
             }
@@ -1026,9 +1129,21 @@ function Invoke-WebRequestWithProxyDetection {
                 }
             }
             $retryAfterSeconds = 0
-            $retryAfter = [string]$httpResponse.Headers['Retry-After']
+            if ($null -ne $httpResponse) {
+                # PS7 surfaces HttpResponseMessage (typed headers); PS5.1 surfaces a WebResponse (string indexer).
+                # The string indexer silently returns $null on PS7, which previously forced every retry onto backoff.
+                if ($httpResponse.GetType().FullName -eq 'System.Net.Http.HttpResponseMessage') {
+                    $retryAfterHeader = $httpResponse.Headers.RetryAfter
+                    if ($null -ne $retryAfterHeader -and $null -ne $retryAfterHeader.Delta) {
+                        $retryAfterSeconds = [int]$retryAfterHeader.Delta.TotalSeconds
+                    }
+                }
+                else {
+                    [void][int]::TryParse([string]$httpResponse.Headers['Retry-After'], [ref]$retryAfterSeconds)
+                }
+            }
 
-            if (-not [int]::TryParse($retryAfter, [ref]$retryAfterSeconds)) {
+            if ($retryAfterSeconds -le 0) {
                 $retryAfterSeconds = [int][Math]::Pow(2, $attempt)
             }
 
@@ -1045,19 +1160,38 @@ function Confirm-ProxyServer {
         [Parameter(Mandatory = $true)][string]$TargetUri
     )
 
+    # The system proxy lookup is comparatively expensive and the result does not change
+    # mid-run, so cache it per host instead of resolving it on every Graph request.
+    if ($null -eq $Script:ProxyDetectionCache) {
+        $Script:ProxyDetectionCache = @{}
+    }
+
+    $cacheKey = $TargetUri
+    $parsedTarget = $null
+    if ([Uri]::TryCreate($TargetUri, [UriKind]::Absolute, [ref]$parsedTarget)) {
+        $cacheKey = $parsedTarget.GetLeftPart([System.UriPartial]::Authority)
+    }
+
+    if ($Script:ProxyDetectionCache.ContainsKey($cacheKey)) {
+        return $Script:ProxyDetectionCache[$cacheKey]
+    }
+
     Write-Log "Calling $($MyInvocation.MyCommand)" -Level DEBUG
     try {
         $proxyObject = ([System.Net.WebRequest]::GetSystemWebProxy()).GetProxy($TargetUri)
         if ($TargetUri -ne $proxyObject.OriginalString) {
             Write-Log "Proxy server configuration detected" -Level DEBUG
             Write-Log $proxyObject.OriginalString -Level DEBUG
+            $Script:ProxyDetectionCache[$cacheKey] = $true
             return $true
         } else {
             Write-Log "No proxy server configuration detected" -Level DEBUG
+            $Script:ProxyDetectionCache[$cacheKey] = $false
             return $false
         }
     } catch {
         Write-Log "Unable to check for proxy server configuration" -Level DEBUG
+        $Script:ProxyDetectionCache[$cacheKey] = $false
         return $false
     }
 }
@@ -1109,37 +1243,28 @@ function Get-OAuthToken {
     )
     if($PermissionType -eq "Application") {
         $Script:GraphScope = "$($Script:GraphScope).default"
-        if ([System.String]::IsNullOrEmpty($OAuthCertificate)) {
-            $Script:applicationInfo.Add("AppSecret", $OAuthClientSecret)
+        $createOAuthTokenParams = @{
+            TenantID = $OAuthTenantId
+            ClientID = $OAuthClientId
+            Scope    = $Script:GraphScope
+            Endpoint = $azureADEndpoint
         }
-        else {
-            $jwtParams = @{
-                CertificateThumbprint = $OAuthCertificate
-                CertificateStore      = $CertificateStore
-                Issuer                = $OAuthClientId
-                Audience              = "$azureADEndpoint/$OAuthTenantId/oauth2/v2.0/token"
-                Subject               = $OAuthClientId
-            }
-            $jwt = Get-NewJsonWebToken @jwtParams
-    
-            if ($null -eq $jwt) {
-                Write-Log "Unable to generate Json Web Token by using certificate: $CertificateThumbprint" -Level ERROR
+
+        if ([System.String]::IsNullOrEmpty($OAuthCertificate)) {
+            if ($null -eq $OAuthClientSecret) {
+                Write-Log "Application permissions require either -OAuthClientSecret or -OAuthCertificate." -Level ERROR
                 exit 1
             }
-    
-            $Script:applicationInfo.Add("AppSecret", $jwt)
-            $Script:applicationInfo.Add("CertificateThumbprint", $OAuthCertificate)
+            # Keep it as a SecureString end to end.
+            $Script:applicationInfo.ClientSecret  = $OAuthClientSecret
+            $createOAuthTokenParams.ClientSecret  = $OAuthClientSecret
         }
-    
-        $createOAuthTokenParams = @{
-            TenantID                       = $OAuthTenantId
-            ClientID                       = $OAuthClientId
-            Secret                         = $Script:applicationInfo.AppSecret
-            Scope                          = $Script:GraphScope
-            Endpoint                       = $azureADEndpoint
-            CertificateBasedAuthentication = (-not([System.String]::IsNullOrEmpty($OAuthCertificate)))
+        else {
+            $createOAuthTokenParams.CertificateBasedAuthentication = $true
+            $Script:applicationInfo.CertificateThumbprint = $OAuthCertificate
+            $createOAuthTokenParams.ClientAssertion = New-ClientAssertion -Thumbprint $OAuthCertificate -ClientId $OAuthClientId -TenantId $OAuthTenantId -AzureADEndpoint $azureADEndpoint
         }
-    
+
         #Create OAUTH token
         $oAuthReturnObject = Get-ApplicationAccessToken @createOAuthTokenParams
         if ($oAuthReturnObject.Successful -eq $false) {
@@ -1175,6 +1300,20 @@ function Get-OAuthToken {
     }    
 }
 
+function Clear-SensitiveState {
+    [CmdletBinding()]
+    param()
+
+    $Script:Token        = $null
+    $Script:RefreshToken = $null
+
+    if ($null -ne $Script:applicationInfo) {
+        $Script:applicationInfo.Remove('ClientSecret')
+        $Script:applicationInfo.Remove('CertificateThumbprint')
+    }
+
+    [System.GC]::Collect()
+}
 function ConvertTo-SearchResult{
     [CmdletBinding()]
     param(
@@ -1248,6 +1387,7 @@ function ConvertTo-DeleteResult{
         Id=$currentBatch[[int]$Response.id].id
         Folder=$currentBatch[[int]$Response.id].folder
         Subject=$currentBatch[[int]$Response.id].subject
+        InternetMessageId=$currentBatch[[int]$Response.id].internetMessageId
         ReceivedDateTime=$currentBatch[[int]$Response.id].receivedDateTime
         From=$currentBatch[[int]$Response.id].from
         Attachment=$currentBatch[[int]$Response.id].attachment
@@ -1366,6 +1506,12 @@ function SearchMailbox {
                 }
                 $folderValue = $Matches[1]
 
+                # The redirect is server supplied, but it is concatenated straight into the request path,
+                # so reject anything that could add a segment or a query string.
+                if ($folderValue -match '[/\\?#&\s]') {
+                    throw "Auxiliary archive folder ID from redirect contains unexpected characters."
+                }
+
                 $parsedGuid = [guid]::Empty
                 if (-not [guid]::TryParse($mailboxGuid, [ref]$parsedGuid)) {
                     throw "Invalid auxiliary archive mailbox ID."
@@ -1377,11 +1523,13 @@ function SearchMailbox {
                 $mailboxName = "$mailboxGuid@$OAuthTenantId"
             }
             else {
+                if ($Script:userMailbox -notmatch '^MBX:[0-9a-fA-F-]{36}@') { throw "Unexpected mailbox identifier format." }
                 $mailboxName = $Script:userMailbox.Substring(4)
                 $Uri = "$($uriQuery)/$($MailboxFolder.id)/messages?"
             }
         }
         else {
+            if ($Script:userMailbox -notmatch '^MBX:[0-9a-fA-F-]{36}@') { throw "Unexpected mailbox identifier format." }
             $mailboxName = $script:userMailbox.Substring(4)
             $Uri = "$($uriQuery)/$($MailboxFolder.id)/messages?"
         }
@@ -1390,6 +1538,7 @@ function SearchMailbox {
         if([string]::IsNullOrEmpty($UriFilter)) {
             #Build the search query based on the parameters provided to the script
             $UriFilter = CreateSearchQuery
+            Write-Log "Search query: $UriFilter" -Level INFO
         }
         # Search the mailbox for items
         $SearchParams = @{
@@ -1412,8 +1561,8 @@ function SearchMailbox {
             foreach($Result in $SearchItems.Content.Value){
                 $item = ConvertTo-SearchResult -Result $Result -MailboxName $mailboxName -FolderPath $MailboxFolder.displayName
                 if($null -ne $item){
-                    $Script:folderSearchResults.Add($item) | Out-Null
-                    $pageResults.Add($item)
+                    [void]$Script:folderSearchResults.Add($item)
+                    [void]$pageResults.Add($item)
                     $Script:TotalSearchResults++
                 }
             }
@@ -1435,8 +1584,8 @@ function SearchMailbox {
                     foreach($Result in $SearchItems.Content.Value){
                         $item = ConvertTo-SearchResult -Result $Result -MailboxName $mailboxName -FolderPath $MailboxFolder.displayName
                         if($null -ne $item){
-                            $Script:folderSearchResults.Add($item) | Out-Null
-                            $pageResults.Add($item)
+                            [void]$Script:folderSearchResults.Add($item)
+                            [void]$pageResults.Add($item)
                             $Script:TotalSearchResults++
                         }
                     }
@@ -1451,6 +1600,7 @@ function SearchMailbox {
             Write-Log ([string]::Format("Search for {0} folder in mailbox {1} had {2} failures.", $MailboxFolder.displayName, $mailboxName, $searchFailures)) -Level WARN
         }
         
+        $confirmation = $null
         #Delete items now to ensure correct mailbox using batches
         if($DeleteContent -and $Script:folderSearchResults.count -gt 0){
             if($searchFailures -gt 0){
@@ -1520,7 +1670,7 @@ function SearchMailbox {
                             }
                         }
                         $itemIdLookup[($x+1)] = $Script:folderSearchResults[$itemsProcessed]
-                        $requests.Add($request) | Out-Null
+                        [void]$requests.Add($request)
                         $itemsProcessed++
                     }
                     
@@ -1539,6 +1689,11 @@ function SearchMailbox {
                         #Setup for list of requests to retry if any of the responses return a 429 status code
                         $retryRequests = [System.Collections.Generic.List[object]]::new()
                         $retryAfterSeconds = 0
+                        #Index the outstanding requests by id so retry correlation is O(1) rather than a scan per response.
+                        $pendingRequestsById = @{}
+                        foreach ($pendingRequest in $pendingRequests) {
+                            $pendingRequestsById[[string]$pendingRequest.Id] = $pendingRequest
+                        }
   
                         #Check the responses from the batch for any failures
                         if($batchDeleteResponse.Successful -eq $false){
@@ -1578,7 +1733,7 @@ function SearchMailbox {
                                 $result = ConvertTo-DeleteResult -Response $response -currentBatch $itemIdLookup -IsFinalAttempt ($attempt -eq $maxAttempts)
                                 if($result.StatusCode -eq 429 -and $attempt -lt $maxAttempts){
                                     #If the request failed with a 429 status code, add it to the list of requests to retry and determine the delay before retrying based on the Retry-After header in the response.
-                                    $requestToRetry = $pendingRequests |  Where-Object { [string]$_.Id -eq [string]$response.Id } | Select-Object -First 1
+                                    $requestToRetry = $pendingRequestsById[[string]$response.Id]
                                     if ($null -ne $requestToRetry) {
                                         $retryRequests.Add($requestToRetry)
                                     }
@@ -1594,11 +1749,10 @@ function SearchMailbox {
                             }
                             $deleteResults | ConvertTo-SafeCsvRecord | Export-Csv -Path $Script:deleteResultsCsvPath -NoTypeInformation -Append -Encoding UTF8
                             Write-Log (
-                                "Batch delete completed: {0} responses, {1} succeeded, {2} failed, {3} retried." -f
+                                "Batch delete completed: {0} responses, {1} succeeded, {2} failed." -f
                                     $deleteResults.Count,
                                     @($deleteResults.Where({ $_.DeleteStatus -eq "Succeeded" })).Count,
-                                    @($deleteResults.Where({ $_.DeleteStatus -eq "Failed" })).Count,
-                                    @($deleteResults.Where({ $_.DeleteStatus -eq "Retry" })).Count
+                                    @($deleteResults.Where({ $_.DeleteStatus -eq "Failed" })).Count
                             ) -Level DEBUG
                         }
                         #Update the request list for the batch to only include the requests that need to be retried due to a 429 status code. If there are no requests to retry, the loop will exit.
@@ -1622,9 +1776,9 @@ function CreateSearchQuery {
     #Use filter if the message body is not specified, otherwise use search
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
-                $Subject = $Subject.Replace("'", "''")
-                $Subject = [Uri]::EscapeDataString($Subject)
-                $UriFilter = "`$filter=contains(subject,`'$Subject`')"
+                $subjectValue = $Subject.Replace("'", "''")
+                $subjectValue = [Uri]::EscapeDataString($subjectValue)
+                $UriFilter = "`$filter=contains(subject,`'$subjectValue`')"
             }
             #Check if the received before and after dates are specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($ReceivedBefore))) {
@@ -1652,13 +1806,13 @@ function CreateSearchQuery {
             }
             #Check if the sender is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Sender))){
-                $Sender = $Sender.Replace("'", "''")
-                $Sender = [Uri]::EscapeDataString($Sender)
+                $senderValue = $Sender.Replace("'", "''")
+                $senderValue = [Uri]::EscapeDataString($senderValue)
                 if($UriFilter -like '*filter*'){
-                    $UriFilter = $UriFilter.Replace('filter=', "filter=(from/emailAddress/address) eq `'$Sender`' and ")
+                    $UriFilter = $UriFilter.Replace('filter=', "filter=(from/emailAddress/address) eq `'$senderValue`' and ")
                 }
                 else {
-                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$Sender`'"
+                    $UriFilter = "`$filter=(from/emailAddress/address) eq `'$senderValue`'"
                 }
             }
             if(-not([string]::IsNullOrEmpty($AttachmentName))){
@@ -1696,7 +1850,7 @@ function GetFolderList{
         exit 1
     }
     foreach($Result in $Script:FolderResults.Content.Value){
-        $Script:folderList.Add($Result) | Out-Null
+        [void]$Script:folderList.Add($Result)
     }   
     while($null -ne $Script:FolderResults.Content.'@odata.nextLink'){
         $Query = [string]$Script:FolderResults.Content.'@odata.nextLink'
@@ -1707,7 +1861,7 @@ function GetFolderList{
             exit 1
         }
         foreach($Result in $Script:FolderResults.Content.Value){
-            $Script:folderList.Add($Result) | Out-Null
+            [void]$Script:folderList.Add($Result)
         }
     }
     
@@ -1812,12 +1966,14 @@ function GetRecoverableItemsFolderList{
 #Safety check to ensure the search is not against the entire mailbox and ConfirmDelete is set to false which would result in all items being deleted from the mailbox
 if((([string]::IsNullOrEmpty($IncludeFolderList)) -and ([string]::IsNullOrEmpty($ExcludeFolderList)) -and $ConfirmDelete -eq $false) -and $DeleteContent){
     Write-Log "Both IncludeFolderList and ExcludeFolderList are not specified and ConfirmDelete is set to false. This could result in all items being deleted from the mailbox. Please review the parameters and try again." -Level ERROR
+    Close-Log
     exit 0
 }
 
 #Peformance check to ensure MessageBody filter is no the only filter specified since this will result in a full mailbox search and could take a long time to complete
 if(([string]::IsNullOrWhiteSpace($Subject) -and [string]::IsNullOrEmpty($ReceivedBefore) -and [string]::IsNullOrEmpty($ReceivedAfter) -and [string]::IsNullOrEmpty($Sender) -and [string]::IsNullOrWhiteSpace($AttachmentName)) -and (-not [string]::IsNullOrWhiteSpace($MessageBody))){
     Write-Log "MessageBody is the only filter specified. This will result in a full mailbox search and could take a long time to complete. Please review the parameters and try again." -Level WARN
+    Close-Log
     exit 0
 }
 
@@ -1831,6 +1987,7 @@ if([string]::IsNullOrWhiteSpace($Subject) -and [string]::IsNullOrEmpty($Received
     #Confirm with the user that they want to continue with the search since all content in folders will be deleted
     if($confirmation -ne 0){
         Write-Log "Search cancelled by user." -Level WARN
+        Close-Log
         exit 0
     }
 }
@@ -1845,6 +2002,8 @@ if(-not([string]::IsNullOrEmpty($IncludeFolderList))){
         $normalized = ([string]$IncludeFolderList[$i]).Trim().Trim('\')
 
         if ([string]::IsNullOrWhiteSpace($normalized)) {
+            Write-Log "IncludeFolderList contains an empty folder path." -Level ERROR
+            Close-Log
             throw "IncludeFolderList contains an empty folder path."
         }
         $IncludeFolderList[$i] = "\$normalized"
@@ -1859,6 +2018,8 @@ if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
         $normalized = ([string]$ExcludeFolderList[$i]).Trim().Trim('\')
 
         if ([string]::IsNullOrWhiteSpace($normalized)) {
+            Write-Log "ExcludeFolderList contains an empty folder path." -Level ERROR
+            Close-Log
             throw "ExcludeFolderList contains an empty folder path."
         }
         $ExcludeFolderList[$i] = "\$normalized"
@@ -1985,26 +2146,27 @@ else {
     }
     #>
     foreach ($folderPath in $IncludeFolderList) {
+        # Note: deliberately not named $matches - that is the automatic variable populated by -match.
         if ($ProcessSubfolders) {
-            $matches = @(
+            $matchedFolders = @(
                 $Script:folderListTree | Where-Object {
                     $_.displayName -match "^$([regex]::Escape($folderPath))($|\\)"
                 }
             )
         }
         else {
-            $matches = @(
+            $matchedFolders = @(
                 $Script:folderListTree | Where-Object {
                     [string]::Equals([string]$_.displayName,[string]$folderPath,[StringComparison]::OrdinalIgnoreCase)
                 }
             )
         }
 
-        if ($matches.Count -eq 0) {
+        if ($matchedFolders.Count -eq 0) {
             throw "Included folder '$folderPath' was not found."
         }
 
-        foreach ($match in $matches) {
+        foreach ($match in $matchedFolders) {
             Add-SearchFolder -Folder $match
         }
 
@@ -2030,7 +2192,6 @@ else {
 
 
 #Remove folders that match the exclude list and includes all subfolders
-$removeFolderList = [System.Collections.Generic.List[object]]::new()
 if($ExcludeFolderList){
     Write-Log "Removing excluded folders from the list..." -Level INFO
     #Find all folders that match the exclude list and add them to the remove list
@@ -2125,17 +2286,23 @@ if($Script:TotalSearchResults -gt 0){
     Write-Log "Search complete. $Script:TotalSearchResults item(s) found in total." -Level INFO
     Write-Log "Search results exported to: $($Script:searchResultsCsvPath)" -Level INFO
 }
-if ($Script:TotalItemsDeleted -gt 0) {
-    Write-Log (
-        "Deletion completed with failures. {0} succeeded; {1} failed. Affected folders: {2}" -f
-        $Script:TotalItemsDeleted,
-        $Script:TotalDeleteFailures,
-        ($Script:DeleteFailureFolders -join "; ")
-    ) -Level INFO
+if ($DeleteContent -and ($Script:TotalItemsDeleted -gt 0 -or $Script:TotalDeleteFailures -gt 0)) {
+    if ($Script:TotalDeleteFailures -gt 0) {
+        Write-Log (
+            "Deletion completed with failures. {0} succeeded; {1} failed. Affected folders: {2}" -f
+            $Script:TotalItemsDeleted,
+            $Script:TotalDeleteFailures,
+            ($Script:DeleteFailureFolders -join "; ")
+        ) -Level WARN
+    }
+    else {
+        Write-Log ("Deletion completed successfully. {0} item(s) deleted; 0 failures." -f $Script:TotalItemsDeleted) -Level INFO
+    }
     Write-Log "Delete results exported to: $($Script:deleteResultsCsvPath)" -Level INFO
 }
 Write-Log "Script completed. Log file: $($Script:LogFile)" -Level INFO
 }
 finally{
+    Clear-SensitiveState
     Close-Log
 }
