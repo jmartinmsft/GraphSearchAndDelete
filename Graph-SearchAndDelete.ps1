@@ -477,6 +477,15 @@ function New-ClientAssertion {
         [Parameter(Mandatory = $true)][string]$AzureADEndpoint
     )
 
+    <#
+        Shared function that builds the client assertion used for certificate-based application
+        (app-only) authentication against Entra ID.
+
+        It is a thin wrapper over Get-NewJsonWebToken that fills in the claims Entra ID expects:
+            Issuer / Subject: the application (client) ID
+            Audience:         the tenant token endpoint, "$AzureADEndpoint/$TenantId/oauth2/v2.0/token"
+    #>
+
     $jwt = Get-NewJsonWebToken -CertificateThumbprint $Thumbprint `
                                -CertificateStore      $CertificateStore `
                                -Issuer                $ClientId `
@@ -492,6 +501,30 @@ function Update-AccessTokenIfNeeded {
     param(
         [switch]$Force
     )
+
+    <#
+        Keeps the OAuth access token in $Script:Token valid for the life of the script.
+
+        Invoke-GraphApiRequest calls this before every Graph request, so a long-running search or
+        delete does not fail part way through when the original token expires. The call is a no-op
+        while the current token is still considered fresh - it is only renewed once
+        $Script:tokenLastRefreshTime is more than 55 minutes old, which leaves headroom before the
+        usual 60 minute lifetime. Pass -Force to renew immediately regardless of age; this is what
+        the 401 retry path in Invoke-GraphApiRequest uses when Graph rejects a token early, for
+        example after a revocation.
+
+        How the token is renewed depends on $PermissionType:
+            Application: requests a brand new token via the client credentials flow, using either a
+                         certificate-backed client assertion (New-ClientAssertion) or the stored
+                         client secret.
+            Delegated:   redeems $Script:RefreshToken against the token endpoint and stores the
+                         rotated refresh token that comes back with the response.
+
+        On success $Script:Token and $Script:tokenLastRefreshTime are updated in place (plus
+        $Script:RefreshToken in the delegated case) and nothing is returned. Any failure to obtain a
+        token throws, deliberately stopping the caller rather than letting it continue unauthenticated.
+    #>
+
     if($null -ne $Script:tokenLastRefreshTime) {
         $refreshAt = $Script:tokenLastRefreshTime.AddMinutes(55)
     }
@@ -1002,6 +1035,40 @@ function Invoke-WebRequestWithProxyDetection {
         [Parameter(Mandatory = $false, ParameterSetName = "Default")][string]$OutFile
     )
 
+    <#
+        Single wrapper around Invoke-WebRequest used for every outbound HTTP call in the script.
+        It exists so proxy handling, throttling retries and error shaping live in one place instead
+        of being repeated at each call site.
+
+        It can be called two ways:
+            Default:          pass -Uri (optionally -OutFile / -UseBasicParsing) for simple requests.
+            ParametersObject: pass a hashtable that is splatted straight onto Invoke-WebRequest.
+                              This is what Invoke-GraphApiRequest uses so it can control headers,
+                              method, body and MaximumRedirection.
+
+        Behavior it adds on top of Invoke-WebRequest:
+            Proxy       - if Confirm-ProxyServer finds an explicit proxy in front of the target,
+                          ProxyUseDefaultCredentials is turned on so the request can authenticate to
+                          it. A value already supplied by the caller is left alone.
+            Throttling  - HTTP 429 is retried up to 4 times, waiting for the interval Graph asks for
+                          in Retry-After (read from typed headers on PS7 and string headers on PS5.1)
+                          or falling back to exponential backoff when the header is absent.
+            Errors      - all other failures stop immediately and are converted from a terminating
+                          exception into a returned object, so callers can branch on a status code
+                          rather than wrapping every call in try/catch:
+                            308  ErrorCode "PermanentRedirect" with the Location header in
+                                 ErrorMessage. This is how an auxiliary archive mailbox is
+                                 discovered, and is why redirects must not be followed.
+                            5xx  ErrorCode from the status description.
+                            all others: the Graph JSON error body is parsed for code and message,
+                                 falling back to the raw body or exception text, truncated for logging.
+
+        Note the return type differs by outcome: a successful request returns the native response
+        object from Invoke-WebRequest, while a failure returns a PSCustomObject with ErrorCode,
+        ErrorMessage, StatusCode and Successful. Callers should test StatusCode rather than assume a
+        web response was returned.
+    #>
+
     Write-Log "Calling $($MyInvocation.MyCommand)" -Level DEBUG
     if ([System.String]::IsNullOrEmpty($Uri)) {
         $Uri = $ParametersObject.Uri
@@ -1241,6 +1308,29 @@ function Get-OAuthToken {
     param(
         [array]$AppScope
     )
+
+    <#
+        Performs the initial sign-in for the script and seeds the token state that everything else
+        depends on. It runs once during start-up; Update-AccessTokenIfNeeded takes over from there
+        and handles renewal for the rest of the run.
+
+        The flow depends on $PermissionType:
+            Application: appends ".default" to the scope, as the client credentials flow requires,
+                         and authenticates with either the client secret or a certificate-backed
+                         client assertion. Exactly one must be supplied. The credential is recorded
+                         in $Script:applicationInfo so the token can later be renewed unattended.
+            Delegated:   ensures email, openid and offline_access are present in $AppScope -
+                         offline_access is what causes Entra ID to issue the refresh token needed to
+                         stay signed in - then runs the interactive authorization code flow with
+                         PKCE via Get-DelegatedAccessToken.
+
+        On success it populates $Script:Token and $Script:tokenLastRefreshTime, plus
+        $Script:RefreshToken in the delegated case, and returns nothing.
+
+        On failure it logs the underlying error and terminates the script with exit rather than
+        throwing. Nothing downstream can run without a token, so there is no useful recovery.
+    #>
+
     if($PermissionType -eq "Application") {
         $Script:GraphScope = "$($Script:GraphScope).default"
         $createOAuthTokenParams = @{
@@ -1304,6 +1394,25 @@ function Clear-SensitiveState {
     [CmdletBinding()]
     param()
 
+    <#
+        Tears down the credential material the script has been holding in script scope.
+
+        It is called from the finally block at the end of the script, so it runs whether the script
+        completed normally, failed, or was interrupted. That matters most in an interactive session,
+        where the PowerShell host stays alive afterwards and any variables left behind remain
+        readable by anything else running in that session.
+
+        Cleared here:
+            $Script:Token and $Script:RefreshToken - the bearer and refresh tokens.
+            $Script:applicationInfo - the ClientSecret and CertificateThumbprint entries are removed
+            so a later call cannot silently mint a new token from leftover credentials.
+
+        The garbage collection at the end is a best-effort prompt to drop unreferenced copies
+        sooner. It is not a guarantee: .NET strings are immutable, so any plaintext that was already
+        materialised may persist in memory until it happens to be overwritten. This is why secrets
+        are handled as SecureString for as long as possible elsewhere in the script.
+    #>
+
     $Script:Token        = $null
     $Script:RefreshToken = $null
 
@@ -1326,7 +1435,30 @@ function ConvertTo-SearchResult{
         [Parameter(Mandatory)]
         [string]$FolderPath
     )
-    
+
+    <#
+        Turns a single raw message returned by Graph into the flat record the rest of the script
+        works with, and applies the last of the search criteria while doing so.
+
+        The filtering matters as much as the conversion. AttachmentName and MessageBody cannot be
+        expressed in the Graph $filter used by CreateSearchQuery, so they are evaluated here against
+        the message that came back:
+            AttachmentName - case-insensitive exact match on an attachment name. Relies on the
+                             attachments having been expanded on the request.
+            MessageBody    - case-insensitive substring match against the message body content.
+        Both are read from script scope, and either one failing to match returns $null so the
+        caller can discard the message. A message is only a real hit if this function returns an
+        object.
+
+        MailboxName and FolderPath are supplied by the caller because a Graph message does not carry
+        the mailbox it came from or the display path of the folder it was found in.
+
+        The returned object is deliberately flat and ordered: it is written straight to the search
+        results CSV and its id property is the message id later submitted in the $batch delete
+        request, so field names are part of the contract with ConvertTo-DeleteResult and the CSV
+        output.
+    #>
+
     #Check if attachment name is specified
     $matchedAttachment = $null
 
@@ -1381,6 +1513,33 @@ function ConvertTo-DeleteResult{
         [object]$currentBatch,[Parameter(Mandatory)]
         [bool]$IsFinalAttempt
     )
+
+    <#
+        Interprets one sub-response from a Graph $batch delete and produces the row that is written
+        to the delete results CSV. It is called once per item in the batch response.
+
+        A $batch response only reports an id and a status; it does not echo back any detail about
+        the message that was deleted. The id is the index the request was submitted under, so it is
+        used to look the original item up in $currentBatch - the lookup built from the
+        ConvertTo-SearchResult records for this batch - and the two are merged into a single record
+        carrying both what was targeted and what happened to it.
+
+        The status drives the outcome:
+            204     the delete succeeded.
+            429     throttled. If attempts remain the item is marked Retry and the caller resubmits
+                    it; $IsFinalAttempt is what turns a retryable throttle into a recorded failure.
+            other   treated as a failure and logged.
+
+        This is not a pure conversion. It also maintains the running totals the end of run summary
+        reports - $Script:itemsDeleted, $Script:TotalItemsDeleted, $Script:itemsFailedDelete and
+        $Script:TotalDeleteFailures - and records the folder name in $Script:DeleteFailureFolders
+        when an item could not be deleted.
+
+        Note that the folder name used for failure reporting comes from $MailboxFolder, which is
+        read from the calling scope rather than passed in as a parameter. The function therefore
+        only reports folders correctly when called from within the folder processing loop.
+    #>
+
     #Create object with item information
     $item = [PSCustomObject]@{
         Mailbox=$currentBatch[[int]$Response.id].mailbox
@@ -1429,6 +1588,31 @@ function ConvertTo-DeleteResult{
 function Protect-CsvValue {
     param([AllowNull()][object]$Value)
 
+    <#
+        Sanitises a single field before it is written to one of the CSV reports.
+
+        Values such as subject, sender and attachment name come from received mail, so they are
+        attacker controlled and must not be trusted just because they are only being written to a
+        file. Two problems are handled:
+
+        Formula injection - Excel and other spreadsheet applications treat a cell beginning with
+            =, +, - or @ as a formula, so simply opening the report could evaluate content that
+            arrived in an email subject. Any such value is prefixed with a single quote, which
+            forces the cell to be read as text. Leading whitespace is included in the check because
+            spreadsheet parsers skip it when deciding whether a cell is a formula.
+
+        Record splitting - embedded carriage returns and line feeds are replaced with spaces so one
+            message always occupies one physical line. This keeps the report readable and stops a
+            crafted subject from appearing to add extra rows.
+
+        $null is passed straight through so blank fields stay blank rather than becoming an empty
+        string. Callers do not use this directly; ConvertTo-SafeCsvRecord applies it to every string
+        property of a record.
+
+        Because the value can be altered, the CSV is intended for reporting and review. It is not a
+        byte for byte copy of the original message properties.
+    #>
+
     if ($null -eq $Value) {
         return $null
     }
@@ -1452,6 +1636,26 @@ function ConvertTo-SafeCsvRecord {
         [object]$InputObject
     )
 
+    <#
+        Pipeline wrapper that makes a whole record safe to export, so call sites can pipe straight
+        into Export-Csv without having to remember which individual fields need sanitising:
+
+            $pageResults | ConvertTo-SafeCsvRecord | Export-Csv ...
+
+        Each object is rebuilt property by property into a new PSCustomObject. String properties are
+        passed through Protect-CsvValue; everything else - status codes, numbers, booleans - is
+        copied unchanged, since only text can carry a leading formula character or an embedded line
+        break. The original object is never modified.
+
+        The rebuild uses an ordered dictionary so the property order of the source object is
+        preserved. That matters because Export-Csv takes its column order and header from the first
+        object it receives, and these reports are written incrementally with -Append across several
+        pages of results.
+
+        Applying this to every record rather than to selected fields means new properties added to
+        the search or delete result objects are protected automatically.
+    #>
+
     process {
         $record = [ordered]@{}
 
@@ -1471,6 +1675,49 @@ function SearchMailbox {
     param(
         [string]$uriQuery
     )
+
+    <#
+        Main worker of the script. Walks every folder collected in $Script:searchFolders, searches
+        it for matching messages, writes the hits to the search results CSV, and - when
+        -DeleteContent was supplied - deletes them before moving on to the next folder.
+
+        $uriQuery is the base mailFolders path for the target mailbox. The folder id and /messages
+        are appended to it for each folder in turn.
+
+        Per folder the sequence is:
+
+        1. Archive location. When -Archive is used the folder is first probed on the beta endpoint
+           via admin/exchange/mailboxes/{mailbox}/folders/{id}. A 308 response means the folder
+           actually lives in an auxiliary archive mailbox, and the Location header carries both the
+           auxiliary mailbox GUID and the id of the folder inside it. Those values are extracted,
+           validated, and used to retarget the request. This is the reason redirects must not be
+           followed automatically - the Location header is the payload, not a detour.
+
+        2. Query. The $filter is produced once by CreateSearchQuery and reused for every folder,
+           since the criteria do not change. Requests ask for immutable ids
+           (Prefer: IdType="ImmutableId") so an id obtained during the search is still valid when
+           the delete is issued.
+
+        3. Paging. Results are followed through @odata.nextLink to the end. Each message is passed
+           through ConvertTo-SearchResult, which also applies the AttachmentName and MessageBody
+           criteria that cannot be expressed in the Graph filter. Each page is appended to the CSV
+           as it is retrieved rather than being held until the end.
+
+        4. Delete. Deletes are performed per folder, immediately after that folder is searched,
+           because the target mailbox can differ from folder to folder once auxiliary archives are
+           involved. Items are removed in $batch requests of -BatchSize, using permanentDelete when
+           -HardDelete is set and a normal DELETE otherwise. Throttled items are retried with
+           backoff, and every outcome is recorded through ConvertTo-DeleteResult.
+           The user is prompted before deleting when the folder search reported failures, because
+           the result set is known to be incomplete, and again per folder when -ConfirmDelete is
+           used - answering All stops further prompting.
+
+        Nothing is returned. Progress is reported through the log and the two CSV files, and running
+        state is kept in script scope: $Script:folderSearchResults for the current folder,
+        $Script:TotalSearchResults, $Script:IncompleteSearchFolders, $Script:DeleteFailureFolders
+        and the delete counters used by the end of run summary.
+    #>
+
     Write-Log "Performing search against the mailbox..." -Level INFO
     $Script:IncompleteSearchFolders = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     [int64]$Script:TotalSearchResults = 0
@@ -1773,6 +2020,37 @@ function SearchMailbox {
     }   
 }    
 function CreateSearchQuery {
+
+    <#
+        Builds the OData query string that is appended to each folder's /messages endpoint. It is
+        called once per run by SearchMailbox and the result is reused for every folder, since the
+        criteria do not change between them.
+
+        The criteria are read from script scope rather than passed in: $Subject, $ReceivedBefore,
+        $ReceivedAfter, $Sender, $AttachmentName, $MessageBody and $ResultSize. Only the ones that
+        were supplied contribute a clause, and clauses are combined with "and" by rewriting the
+        existing "filter=" prefix, so they can be assembled in any order. If no criteria are given,
+        no filter is emitted and every item in the folder matches.
+
+        Values that come from user input are escaped twice on the way in: single quotes are doubled,
+        which is how a quote is represented inside an OData string literal, and the result is then
+        URL encoded. Without the first step a value containing a quote could close the literal early
+        and append predicates of its own. Dates are converted to UTC and written in ISO 8601 form,
+        because receivedDateTime is evaluated in UTC.
+
+        Two criteria cannot be fully evaluated by Graph and are only partially represented here:
+            AttachmentName - contributes hasAttachments eq true and expands the attachment
+                             collection so the names are present in the response. The name itself is
+                             matched client side by ConvertTo-SearchResult.
+            MessageBody    - not filterable at all. It only causes the body property to be added to
+                             $select so the text is available for the client side match.
+
+        The query always ends with a $select, to avoid pulling back properties the script does not
+        use, and $top set to $ResultSize. Note that $top is the page size rather than a limit on the
+        number of results: SearchMailbox continues to follow @odata.nextLink until the folder is
+        exhausted.
+    #>
+
     #Use filter if the message body is not specified, otherwise use search
             #Check if the subject is specified and build the filter query accordingly
             if(-not([string]::IsNullOrEmpty($Subject))) {
@@ -1834,6 +2112,29 @@ function CreateSearchQuery {
 }
     
 function GetFolderList{
+
+    <#
+        Enumerates every mail folder in the target mailbox and stores the raw results in
+        $Script:folderList. This is the first step of folder selection: once the list is complete it
+        calls BuildFolderListTree, which resolves each folder's parent chain into a full display
+        path and produces $Script:folderListTree - the collection the include and exclude parameters
+        are matched against.
+
+        The mailFolders/delta endpoint is used rather than mailFolders because delta returns the
+        entire hierarchy, nested subfolders included, as one paginated sequence. Enumerating through
+        mailFolders instead would only return the children of whichever folder was asked for,
+        requiring a request per level of the tree.
+
+        The mailbox is identified by $Script:userMailbox, so whether the primary or the archive is
+        enumerated has already been decided by the time this runs. Results are paged through
+        @odata.nextLink until no further link is returned.
+
+        Failure at any point is fatal: the error is logged and the script exits, because folder
+        selection, searching and deleting all depend on having a complete folder list. Continuing
+        with a partial list would risk reporting a folder as clean simply because it was never
+        enumerated.
+    #>
+
     Write-Log "Getting a list of folders in the mailbox..." -Level INFO
     #Create an arraylist to hold the folder results
     $Script:folderList = [System.Collections.Generic.List[object]]::new()
@@ -1870,6 +2171,33 @@ function GetFolderList{
 }
 
 function BuildFolderListTree{
+
+    <#
+        Turns the flat folder list produced by GetFolderList into something the include and exclude
+        parameters can be matched against.
+
+        Graph returns each folder with only its own displayName and a parentFolderId, so nothing in
+        the raw list says where a folder sits in the hierarchy - and display names are not unique, as
+        several parents can each contain an "Archive" or "2024" subfolder. This function walks each
+        folder's parent chain and rewrites displayName in place to the full backslash delimited path,
+        for example "\Inbox\Projects\2024". Those paths are what -IncludeFolderList and
+        -ExcludeFolderList are compared against, and what appears in the log and CSV output.
+
+        Paths are resolved recursively with two safeguards. Results are memoised in $pathCache, so a
+        deep tree resolves each ancestor once rather than once per descendant. A set of the folders
+        currently being visited is carried down the recursion, and a folder that is encountered while
+        already being resolved means the parent chain loops back on itself, which would otherwise
+        recurse until the call stack was exhausted; that case throws instead. A folder whose parent
+        is missing from the list is treated as a root, which is what happens for the mailbox root
+        itself.
+
+        The result is stored in $Script:folderListTree, sorted by path so that parents appear
+        immediately before their children in output and prefix matching behaves predictably.
+
+        Note that this mutates the objects in $Script:folderList rather than copying them, so after
+        this runs displayName is a full path everywhere, not a leaf name.
+    #>
+
     Write-Log "Generating folder hierarchy structure for folders" -Level DEBUG
     $foldersById = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
     $namesById = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
@@ -1924,6 +2252,32 @@ function BuildFolderListTree{
 }
 
 function GetRecoverableItemsFolderList{
+
+    <#
+        The -SearchDumpster counterpart to GetFolderList. It enumerates the Recoverable Items
+        subtree - Deletions, Purges, Versions, DiscoveryHolds and so on - and leaves the results in
+        $Script:folderList before calling BuildFolderListTree, so everything downstream (include and
+        exclude matching, searching, deleting) works exactly as it does for a normal folder list.
+
+        The delta endpoint used by GetFolderList is not an option here. Recoverable Items folders are
+        hidden, so they are not returned by mailFolders/delta. Instead the tree is walked explicitly
+        from the well known RecoverableItemsRoot folder using childFolders with
+        includeHiddenFolders=true, which is what makes the hidden folders visible at all.
+
+        Because childFolders only returns one level, the walk is breadth first: a queue holds the
+        folders whose children still need to be requested, and each child found is both recorded and
+        enqueued so its own children are collected on a later pass. A set of already visited ids
+        guards against a folder being processed twice, which would otherwise duplicate entries or
+        loop indefinitely. Each level is paged through @odata.nextLink before moving on.
+
+        Note that RecoverableItemsRoot is seeded as a placeholder object purely to start the walk, so
+        it is used as a parent but never added to the folder list itself - only its descendants are
+        searchable.
+
+        A failure to enumerate any level throws rather than exiting, so the script's outer try and
+        finally still run and sensitive state is cleared and the log is closed.
+    #>
+
     Write-Log "Getting a list of folders in the recoverable items..." -Level INFO
     #Create an arraylist to hold the folder results
     $Script:folderList = [System.Collections.Generic.List[object]]::new()
@@ -1961,6 +2315,45 @@ function GetRecoverableItemsFolderList{
 
     BuildFolderListTree
     Write-Log "Recoverable items enumeration complete. $($Script:folderList.Count) folders found." -Level INFO
+}
+
+function Add-SearchFolder {
+    param([Parameter(Mandatory)][object]$Folder)
+
+    <#
+        The single gate through which every folder must pass to end up in $Script:searchFolders. It
+        exists so the include list, the subfolder expansion and the aux archive expansion below can
+        all add folders freely without any of them having to worry about whether another has already
+        added the same one.
+
+        Deduplication is keyed on the Graph folder id rather than the display name, because names are
+        not unique across a mailbox and the tree paths built by BuildFolderListTree are only unique
+        by convention. The $searchFolderIds HashSet does double duty: its Add returns false when the
+        id is already present, so the membership test and the insert are a single operation. The
+        comparison is ordinal because Graph folder ids are opaque, case sensitive tokens.
+
+        Without this, a folder reachable through more than one rule - for example one named
+        explicitly in -IncludeFolderList and also picked up by -ProcessSubfolders, or an aux archive
+        subfolder matched by both the include pattern and the aux archive pattern - would be searched
+        twice and its messages counted, reported and deleted twice over.
+
+        A folder with no id is fatal rather than skipped. Silently dropping it would leave the caller
+        believing a folder they asked for had been searched and found clean, which is the one failure
+        mode this script must never produce.
+
+        Note that this closes over $searchFolderIds and $Script:searchFolders from the enclosing
+        script scope rather than taking them as parameters - it is defined inline in the main body
+        and is not intended for use anywhere else.
+    #>
+
+    $folderId = [string]$Folder.id
+    if ([string]::IsNullOrWhiteSpace($folderId)) {
+        throw "A selected folder has no valid Graph folder ID."
+    }
+
+    if ($searchFolderIds.Add($folderId)) {
+        $Script:searchFolders.Add($Folder)
+    }
 }
 
 #Safety check to ensure the search is not against the entire mailbox and ConfirmDelete is set to false which would result in all items being deleted from the mailbox
@@ -2025,6 +2418,7 @@ if(-not([string]::IsNullOrEmpty($ExcludeFolderList))){
         $ExcludeFolderList[$i] = "\$normalized"
     }
 }
+
 try{
 #Get parameters and pass to obtain an OAuth token
 $cloudService = Get-CloudServiceEndpoint $AzureEnvironment
@@ -2077,19 +2471,6 @@ Write-Log "Determining folders to search..." -Level INFO
 $Script:searchFolders = [System.Collections.Generic.List[object]]::new()
 $searchFolderIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 
-function Add-SearchFolder {
-    param([Parameter(Mandatory)][object]$Folder)
-
-    $folderId = [string]$Folder.id
-    if ([string]::IsNullOrWhiteSpace($folderId)) {
-        throw "A selected folder has no valid Graph folder ID."
-    }
-
-    if ($searchFolderIds.Add($folderId)) {
-        $Script:searchFolders.Add($Folder)
-    }
-}
-
 #Check is specific folders are specified in the include list, if not, search all folders under the root
 if([string]::IsNullOrEmpty($IncludeFolderList)){
     #If no include list is specified, search all folders under the desired root
@@ -2113,40 +2494,7 @@ if([string]::IsNullOrEmpty($IncludeFolderList)){
 else {
     Write-Log "Building folder search list from include list..." -Level INFO
     #Add folders that match the include list
-    <#
-    if($ProcessSubfolders){
-        foreach($folder in $IncludeFolderList){
-            #Add all subfolders of the specified folder to the search list
-            $includeFolders = ($Script:folderListTree | Where-Object { $_.displayName -match "^" + [regex]::Escape($folder) + "($|\\)"})
-            foreach($iFolder in $includeFolders){
-                $Script:searchFolders.Add($iFolder) | Out-Null
-            }
-        }
-    }
-    else {
-        #Add only the specified folders to the search list
-        foreach($folder in $IncludeFolderList){
-            [void]$Script:searchFolders.Add(($Script:folderListTree | Where-Object { $_.displayName -eq $folder }))
-            if($Archive){
-                $subfolders = ($Script:folderListTree | Where-Object { $_.displayName -match "^" + [regex]::Escape($folder) + "($|\\)"})
-                #Include any subfolders that were created by the aux archive mailbox
-                $auxSubfolders = $subfolders | Where-Object {
-                    $parts = $_ -split '\\'
-                    $rootFolder = $parts[-2]
-                    $lastPart = $parts[-1]
-                    # Check if last part matches pattern: $rootFolder\$rootFolder_YYYY (Created on
-                    $lastPart -match "^$([regex]::Escape($rootFolder))_\d{4}\s+\(Created on"
-                }
-                foreach($subfolder in $auxSubfolders){
-                    $Script:searchFolders.Add($subfolder) | Out-Null
-                }
-
-            }
-        }
-    }
-    #>
     foreach ($folderPath in $IncludeFolderList) {
-        # Note: deliberately not named $matches - that is the automatic variable populated by -match.
         if ($ProcessSubfolders) {
             $matchedFolders = @(
                 $Script:folderListTree | Where-Object {
@@ -2189,35 +2537,10 @@ else {
     }
 }
 
-
-
 #Remove folders that match the exclude list and includes all subfolders
 if($ExcludeFolderList){
     Write-Log "Removing excluded folders from the list..." -Level INFO
     #Find all folders that match the exclude list and add them to the remove list
-    <#
-    foreach ($exclude in $ExcludeFolderList) {
-        [void]$removeFolderList.Add(($Script:searchFolders | Where-Object { $_.displayName -eq $exclude}))
-    }
-    #Remove the excluded folders and all subfolders from the search list
-    if($removeFolderList.Count -gt 0){
-        $newSearchFolders = [System.Collections.Generic.List[object]]::new()
-        foreach($folder in $Script:searchFolders){
-            $shouldExclude = $false
-            foreach($exclude in $ExcludeFolderList){
-                if($folder.displayName.StartsWith("$exclude\",[StringComparison]::OrdinalIgnoreCase) -or $folder.displayName -eq $exclude){
-                    $shouldExclude = $true
-                    break
-                }
-            }
-            if(-not $shouldExclude){
-                $newSearchFolders.Add($folder) | Out-Null
-            }
-        }
-        $Script:searchFolders = $newSearchFolders
-        $newSearchFolders = $null
-    }
-    #>
     foreach ($exclude in $ExcludeFolderList) {
         $excludeExists = @(
             $Script:folderListTree | Where-Object {
